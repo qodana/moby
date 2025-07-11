@@ -1,15 +1,14 @@
-package mounts // import "github.com/docker/docker/volume/mounts"
+package mounts
 
 import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
-	"runtime"
+	"path/filepath"
 	"strings"
 
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/internal/lazyregexp"
 )
 
 // NewWindowsParser creates a parser with Windows semantics.
@@ -79,16 +78,16 @@ const (
 )
 
 var (
-	volumeNameRegexp          = regexp.MustCompile(`^` + rxName + `$`)
-	reservedNameRegexp        = regexp.MustCompile(`^` + rxReservedNames + `$`)
-	hostDirRegexp             = regexp.MustCompile(`^` + rxHostDir + `$`)
-	mountDestinationRegexp    = regexp.MustCompile(`^` + rxDestination + `$`)
-	windowsSplitRawSpecRegexp = regexp.MustCompile(`^` + rxSource + rxDestination + rxMode + `$`)
+	volumeNameRegexp          = lazyregexp.New(`^` + rxName + `$`)
+	reservedNameRegexp        = lazyregexp.New(`^` + rxReservedNames + `$`)
+	hostDirRegexp             = lazyregexp.New(`^` + rxHostDir + `$`)
+	mountDestinationRegexp    = lazyregexp.New(`^` + rxDestination + `$`)
+	windowsSplitRawSpecRegexp = lazyregexp.New(`^` + rxSource + rxDestination + rxMode + `$`)
 )
 
 type mountValidator func(mnt *mount.Mount) error
 
-func (p *windowsParser) splitRawSpec(raw string, splitRegexp *regexp.Regexp) ([]string, error) {
+func (p *windowsParser) splitRawSpec(raw string, splitRegexp *lazyregexp.Regexp) ([]string, error) {
 	match := splitRegexp.FindStringSubmatch(strings.ToLower(raw))
 	if len(match) == 0 {
 		return nil, errInvalidSpec(raw)
@@ -145,7 +144,7 @@ func windowsValidMountMode(mode string) bool {
 func windowsValidateNotRoot(p string) error {
 	p = strings.ToLower(strings.ReplaceAll(p, `/`, `\`))
 	if p == "c:" || p == `c:\` {
-		return fmt.Errorf("destination path cannot be `c:` or `c:\\`: %v", p)
+		return fmt.Errorf(`destination path (%v) cannot be 'c:' or 'c:\'`, p)
 	}
 	return nil
 }
@@ -168,11 +167,12 @@ func windowsValidateAbsolute(p string) error {
 }
 
 func windowsDetectMountType(p string) mount.Type {
-	if strings.HasPrefix(p, `\\.\pipe\`) {
+	switch {
+	case strings.HasPrefix(p, `\\.\pipe\`):
 		return mount.TypeNamedPipe
-	} else if hostDirRegexp.MatchString(p) {
+	case hostDirRegexp.MatchString(p):
 		return mount.TypeBind
-	} else {
+	default:
 		return mount.TypeVolume
 	}
 }
@@ -191,6 +191,7 @@ func (p *windowsParser) ValidateVolumeName(name string) error {
 	}
 	return nil
 }
+
 func (p *windowsParser) ValidateMountConfig(mnt *mount.Mount) error {
 	return p.validateMountConfigReg(mnt, windowsValidators)
 }
@@ -199,10 +200,9 @@ type fileInfoProvider interface {
 	fileInfo(path string) (exist, isDir bool, err error)
 }
 
-type defaultFileInfoProvider struct {
-}
+type defaultFileInfoProvider struct{}
 
-func (defaultFileInfoProvider) fileInfo(path string) (exist, isDir bool, err error) {
+func (defaultFileInfoProvider) fileInfo(path string) (exist, isDir bool, _ error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -214,7 +214,7 @@ func (defaultFileInfoProvider) fileInfo(path string) (exist, isDir bool, err err
 }
 
 func (p *windowsParser) validateMountConfigReg(mnt *mount.Mount, additionalValidators ...mountValidator) error {
-	if len(mnt.Target) == 0 {
+	if mnt.Target == "" {
 		return &errMountConfig{mnt, errMissingField("Target")}
 	}
 	for _, v := range additionalValidators {
@@ -225,7 +225,7 @@ func (p *windowsParser) validateMountConfigReg(mnt *mount.Mount, additionalValid
 
 	switch mnt.Type {
 	case mount.TypeBind:
-		if len(mnt.Source) == 0 {
+		if mnt.Source == "" {
 			return &errMountConfig{mnt, errMissingField("Source")}
 		}
 		// Don't error out just because the propagation mode is not supported on the platform
@@ -250,7 +250,7 @@ func (p *windowsParser) validateMountConfigReg(mnt *mount.Mount, additionalValid
 			return &errMountConfig{mnt, errBindSourceDoesNotExist(mnt.Source)}
 		}
 		if !isdir {
-			return &errMountConfig{mnt, fmt.Errorf("source path must be a directory")}
+			return &errMountConfig{mnt, errors.New("source path must be a directory")}
 		}
 
 	case mount.TypeVolume:
@@ -258,17 +258,29 @@ func (p *windowsParser) validateMountConfigReg(mnt *mount.Mount, additionalValid
 			return &errMountConfig{mnt, errExtraField("BindOptions")}
 		}
 
-		if len(mnt.Source) == 0 && mnt.ReadOnly {
-			return &errMountConfig{mnt, fmt.Errorf("must not set ReadOnly mode when using anonymous volumes")}
+		anonymousVolume := mnt.Source == ""
+		if mnt.VolumeOptions != nil && mnt.VolumeOptions.Subpath != "" {
+			if anonymousVolume {
+				return errAnonymousVolumeWithSubpath
+			}
+
+			// Check if path is relative but without any back traversals
+			if !filepath.IsLocal(mnt.VolumeOptions.Subpath) {
+				return &errMountConfig{mnt, errInvalidSubpath}
+			}
 		}
 
-		if len(mnt.Source) != 0 {
+		if anonymousVolume && mnt.ReadOnly {
+			return &errMountConfig{mnt, errors.New("must not set ReadOnly mode when using anonymous volumes")}
+		}
+
+		if mnt.Source != "" {
 			if err := p.ValidateVolumeName(mnt.Source); err != nil {
 				return &errMountConfig{mnt, err}
 			}
 		}
 	case mount.TypeNamedPipe:
-		if len(mnt.Source) == 0 {
+		if mnt.Source == "" {
 			return &errMountConfig{mnt, errMissingField("Source")}
 		}
 
@@ -380,9 +392,8 @@ func (p *windowsParser) parseMountSpec(cfg mount.Mount, convertTargetToBackslash
 
 	switch cfg.Type {
 	case mount.TypeVolume:
-		if cfg.Source == "" {
-			mp.Name = stringid.GenerateRandomID()
-		} else {
+		if cfg.Source != "" {
+			// non-anonymous volume
 			mp.Name = cfg.Source
 		}
 		mp.CopyData = p.DefaultCopyMode()
@@ -399,6 +410,8 @@ func (p *windowsParser) parseMountSpec(cfg mount.Mount, convertTargetToBackslash
 		mp.Source = strings.ReplaceAll(cfg.Source, `/`, `\`)
 	case mount.TypeNamedPipe:
 		mp.Source = strings.ReplaceAll(cfg.Source, `/`, `\`)
+	default:
+		// TODO(thaJeztah): make switch exhaustive: anything to do for mount.TypeTmpfs, mount.TypeCluster, mount.TypeImage ?
 	}
 	// cleanup trailing `\` except for paths like `c:\`
 	if len(mp.Source) > 3 && mp.Source[len(mp.Source)-1] == '\\' {
@@ -411,8 +424,8 @@ func (p *windowsParser) parseMountSpec(cfg mount.Mount, convertTargetToBackslash
 }
 
 func (p *windowsParser) ParseVolumesFrom(spec string) (string, string, error) {
-	if len(spec) == 0 {
-		return "", "", fmt.Errorf("volumes-from specification cannot be an empty string")
+	if spec == "" {
+		return "", "", errors.New("volumes-from specification cannot be an empty string")
 	}
 
 	id, mode, _ := strings.Cut(spec, ":")
@@ -436,7 +449,7 @@ func (p *windowsParser) DefaultPropagationMode() mount.Propagation {
 }
 
 func (p *windowsParser) ConvertTmpfsOptions(opt *mount.TmpfsOptions, readOnly bool) (string, error) {
-	return "", fmt.Errorf("%s does not support tmpfs", runtime.GOOS)
+	return "", errors.New("windows does not support tmpfs")
 }
 
 func (p *windowsParser) DefaultCopyMode() bool {
@@ -448,7 +461,7 @@ func (p *windowsParser) IsBackwardCompatible(m *MountPoint) bool {
 }
 
 func (p *windowsParser) ValidateTmpfsMountDestination(dest string) error {
-	return errors.New("platform does not support tmpfs")
+	return errors.New("windows does not support tmpfs")
 }
 
 func (p *windowsParser) HasResource(m *MountPoint, absolutePath string) bool {

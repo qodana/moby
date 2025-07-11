@@ -1,18 +1,19 @@
-package opts // import "github.com/docker/docker/opts"
+package opts
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"path"
-	"regexp"
 	"strings"
 
-	units "github.com/docker/go-units"
+	"github.com/docker/docker/internal/lazyregexp"
+	"github.com/docker/go-units"
 )
 
 var (
-	alphaRegexp  = regexp.MustCompile(`[a-zA-Z]`)
-	domainRegexp = regexp.MustCompile(`^(:?(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]))(:?\.(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])))*)\.?\s*$`)
+	alphaRegexp  = lazyregexp.New(`[a-zA-Z]`)
+	domainRegexp = lazyregexp.New(`^(:?(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]))(:?\.(:?[a-zA-Z0-9]|(:?[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])))*)\.?\s*$`)
 )
 
 // ListOpts holds a list of values and a validation function.
@@ -298,13 +299,18 @@ type ValidatorFctType func(val string) (string, error)
 // ValidatorFctListType defines a validator function that returns a validated list of string and/or an error
 type ValidatorFctListType func(val string) ([]string, error)
 
-// ValidateIPAddress validates an Ip address.
+// ValidateIPAddress validates if the given value is a correctly formatted
+// IP address, and returns the value in normalized form. Leading and trailing
+// whitespace is allowed, but it does not allow IPv6 addresses surrounded by
+// square brackets ("[::1]").
+//
+// Refer to [net.ParseIP] for accepted formats.
 func ValidateIPAddress(val string) (string, error) {
-	var ip = net.ParseIP(strings.TrimSpace(val))
+	ip := net.ParseIP(strings.TrimSpace(val))
 	if ip != nil {
 		return ip.String(), nil
 	}
-	return "", fmt.Errorf("%s is not an ip address", val)
+	return "", fmt.Errorf("IP address is not correctly formatted: %s", val)
 }
 
 // ValidateDNSSearch validates domain for resolvconf search configuration.
@@ -360,7 +366,7 @@ func ValidateSingleGenericResource(val string) (string, error) {
 // ParseLink parses and validates the specified string as a link format (name:alias)
 func ParseLink(val string) (string, string, error) {
 	if val == "" {
-		return "", "", fmt.Errorf("empty string specified for links")
+		return "", "", errors.New("empty string specified for links")
 	}
 	arr := strings.Split(val, ":")
 	if len(arr) > 2 {

@@ -1,4 +1,4 @@
-package vfs // import "github.com/docker/docker/daemon/graphdriver/vfs"
+package vfs
 
 import (
 	"fmt"
@@ -7,19 +7,21 @@ import (
 
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/docker/internal/containerfs"
 	"github.com/docker/docker/quota"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 )
 
-var (
-	// CopyDir defines the copy method to use.
-	CopyDir = dirCopy
+const (
+	xattrsStorageOpt         = "vfs.xattrs"
+	bestEffortXattrsOptValue = "i_want_broken_containers"
 )
+
+// CopyDir defines the copy method to use.
+var CopyDir = dirCopy
 
 func init() {
 	graphdriver.Register("vfs", Init)
@@ -27,7 +29,7 @@ func init() {
 
 // Init returns a new VFS driver.
 // This sets the home directory for the driver and returns NaiveDiffDriver.
-func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdriver.Driver, error) {
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	d := &Driver{
 		home:      home,
 		idMapping: idMap,
@@ -37,11 +39,8 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, err
 	}
 
-	dirID := idtools.Identity{
-		UID: idtools.CurrentIdentity().UID,
-		GID: d.idMapping.RootPair().GID,
-	}
-	if err := idtools.MkdirAllAndChown(home, 0710, dirID); err != nil {
+	_, gid := d.idMapping.RootPair()
+	if err := user.MkdirAllAndChown(home, 0o710, os.Getuid(), gid); err != nil {
 		return nil, err
 	}
 
@@ -51,7 +50,11 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, quota.ErrQuotaNotSupported
 	}
 
-	return graphdriver.NewNaiveDiffDriver(d, d.idMapping), nil
+	return &graphdriver.NaiveDiffDriver{
+		ProtoDriver:      d,
+		IDMap:            d.idMapping,
+		BestEffortXattrs: d.bestEffortXattrs,
+	}, nil
 }
 
 // Driver holds information about the driver, home directory of the driver.
@@ -60,16 +63,24 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 // Driver must be wrapped in NaiveDiffDriver to be used as a graphdriver.Driver
 type Driver struct {
 	driverQuota
-	home      string
-	idMapping idtools.IdentityMapping
+	home             string
+	idMapping        user.IdentityMapping
+	bestEffortXattrs bool
 }
 
 func (d *Driver) String() string {
 	return "vfs"
 }
 
-// Status is used for implementing the graphdriver.ProtoDriver interface. VFS does not currently have any status information.
+// Status is used for implementing the graphdriver.ProtoDriver interface.
 func (d *Driver) Status() [][2]string {
+	if d.bestEffortXattrs {
+		return [][2]string{
+			// These strings are looked for in daemon/info_unix.go:fillDriverWarnings()
+			// because plumbing is hard and temporary is forever. Forgive me.
+			{"Extended file attributes", "best-effort"},
+		}
+	}
 	return nil
 }
 
@@ -85,7 +96,7 @@ func (d *Driver) Cleanup() error {
 
 func (d *Driver) parseOptions(options []string) error {
 	for _, option := range options {
-		key, val, err := parsers.ParseKeyValueOpt(option)
+		key, val, err := graphdriver.ParseStorageOptKeyValue(option)
 		if err != nil {
 			return errdefs.InvalidParameter(err)
 		}
@@ -98,6 +109,11 @@ func (d *Driver) parseOptions(options []string) error {
 			if err = d.setQuotaOpt(uint64(size)); err != nil {
 				return errdefs.InvalidParameter(errors.Wrap(err, "failed to set option size for vfs"))
 			}
+		case xattrsStorageOpt:
+			if val != bestEffortXattrsOptValue {
+				return errdefs.InvalidParameter(errors.Errorf("do not set the " + xattrsStorageOpt + " option unless you are willing to accept the consequences"))
+			}
+			d.bestEffortXattrs = true
 		default:
 			return errdefs.InvalidParameter(errors.Errorf("unknown option %s for vfs", key))
 		}
@@ -134,7 +150,7 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 // Create prepares the filesystem for the VFS driver and copies the directory for the given id under the parent.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	if opts != nil && len(opts.StorageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported for vfs on read-only layers")
+		return errors.New("--storage-opt is not supported for vfs on read-only layers")
 	}
 
 	return d.create(id, parent, 0)
@@ -142,16 +158,12 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 
 func (d *Driver) create(id, parent string, size uint64) error {
 	dir := d.dir(id)
-	rootIDs := d.idMapping.RootPair()
+	uid, gid := d.idMapping.RootPair()
 
-	dirID := idtools.Identity{
-		UID: idtools.CurrentIdentity().UID,
-		GID: rootIDs.GID,
-	}
-	if err := idtools.MkdirAllAndChown(filepath.Dir(dir), 0710, dirID); err != nil {
+	if err := user.MkdirAllAndChown(filepath.Dir(dir), 0o710, os.Getuid(), gid); err != nil {
 		return err
 	}
-	if err := idtools.MkdirAndChown(dir, 0755, rootIDs); err != nil {
+	if err := user.MkdirAndChown(dir, 0o755, uid, gid); err != nil {
 		return err
 	}
 

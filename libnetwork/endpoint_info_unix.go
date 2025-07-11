@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package libnetwork
 
@@ -10,12 +9,6 @@ func (ep *Endpoint) DriverInfo() (map[string]interface{}, error) {
 	ep, err := ep.retrieveFromStore()
 	if err != nil {
 		return nil, err
-	}
-
-	if sb, ok := ep.getSandbox(); ok {
-		if gwep := sb.getEndpointInGWNetwork(); gwep != nil && gwep.ID() != ep.ID() {
-			return gwep.DriverInfo()
-		}
 	}
 
 	n, err := ep.getNetworkFromStore()

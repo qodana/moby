@@ -1,9 +1,9 @@
 //go:build linux
-// +build linux
 
-package journald // import "github.com/docker/docker/daemon/logger/journald"
+package journald
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -48,13 +48,13 @@ const (
 var waitUntilFlushed func(*journald) error
 
 type journald struct {
-	// Sequence number of the most recent message sent by this instance of
-	// the log driver, starting from 1. Corollary: ordinal == 0 implies no
-	// messages have been sent by this instance.
-	ordinal uint64 // Placed first in struct to ensure 8-byte alignment for atomic ops.
 	// Epoch identifier to distinguish sequence numbers from this instance
 	// vs. other instances.
 	epoch string
+	// Sequence number of the most recent message sent by this instance of
+	// the log driver, starting from 1. Corollary: ordinal == 0 implies no
+	// messages have been sent by this instance.
+	ordinal atomic.Uint64
 
 	vars map[string]string // additional variables and values to send to the journal along with the log message
 
@@ -63,8 +63,8 @@ type journald struct {
 	// Overrides for unit tests.
 
 	sendToJournal   func(message string, priority journal.Priority, vars map[string]string) error
-	journalReadDir  string //nolint:unused // Referenced in read.go, which has more restrictive build constraints.
-	readSyncTimeout time.Duration
+	journalReadDir  string        //nolint:unused // Referenced in read.go, which has more restrictive build constraints.
+	readSyncTimeout time.Duration //nolint:unused // Referenced in read.go, which has more restrictive build constraints.
 }
 
 func init() {
@@ -88,10 +88,11 @@ func sanitizeKeyMod(s string) string {
 		} else if ('Z' < v || v < 'A') && ('9' < v || v < '0') {
 			v = '_'
 		}
-		// If (n == "" && v == '_'), then we will skip as this is the beginning with '_'
-		if !(n == "" && v == '_') {
-			n += string(v)
+		if n == "" && v == '_' {
+			// skip leading underscores
+			continue
 		}
+		n += string(v)
 	}
 	return n
 }
@@ -100,13 +101,13 @@ func sanitizeKeyMod(s string) string {
 // the context.
 func New(info logger.Info) (logger.Logger, error) {
 	if !journal.Enabled() {
-		return nil, fmt.Errorf("journald is not enabled on this host")
+		return nil, errors.New("journald is not enabled on this host")
 	}
 
-	return new(info)
+	return newJournald(info)
 }
 
-func new(info logger.Info) (*journald, error) {
+func newJournald(info logger.Info) (*journald, error) {
 	// parse log tag
 	tag, err := loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
 	if err != nil {
@@ -177,7 +178,7 @@ func (s *journald) Log(msg *logger.Message) error {
 	source := msg.Source
 	logger.PutMessage(msg)
 
-	seq := atomic.AddUint64(&s.ordinal, 1)
+	seq := s.ordinal.Add(1)
 	vars[fieldLogOrdinal] = strconv.FormatUint(seq, 10)
 
 	if source == "stderr" {

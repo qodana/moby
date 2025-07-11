@@ -1,17 +1,17 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 
 	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/container"
 	volumemounts "github.com/docker/docker/volume/mounts"
 	volumeopts "github.com/docker/docker/volume/service/opts"
 )
 
 // createContainerOSSpecificSettings performs host-OS specific container create functionality
-func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
+func (daemon *Daemon) createContainerOSSpecificSettings(ctx context.Context, container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
 	if containertypes.Isolation.IsDefault(hostConfig.Isolation) {
 		// Make sure the host config has the default daemon isolation if not specified by caller.
 		hostConfig.Isolation = daemon.defaultIsolation
@@ -34,7 +34,7 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 
 		// Create the volume in the volume driver. If it doesn't exist,
 		// a new one will be created.
-		v, err := daemon.volumes.Create(context.TODO(), "", volumeDriver, volumeopts.WithCreateReference(container.ID))
+		v, err := daemon.volumes.Create(ctx, "", volumeDriver, volumeopts.WithCreateReference(container.ID))
 		if err != nil {
 			return err
 		}

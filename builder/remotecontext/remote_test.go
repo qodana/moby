@@ -1,4 +1,4 @@
-package remotecontext // import "github.com/docker/docker/builder/remotecontext"
+package remotecontext
 
 import (
 	"bytes"
@@ -11,7 +11,6 @@ import (
 	"github.com/docker/docker/builder"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
-	"gotest.tools/v3/fs"
 )
 
 var binaryContext = []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00} // xz magic
@@ -37,7 +36,7 @@ func TestSelectAcceptableMIME(t *testing.T) {
 	}
 
 	for _, m := range invalidMimeStrings {
-		if len(selectAcceptableMIME(m)) > 0 {
+		if selectAcceptableMIME(m) != "" {
 			t.Fatalf("Should not have accepted %q", m)
 		}
 	}
@@ -173,9 +172,8 @@ func TestUnknownContentLength(t *testing.T) {
 }
 
 func TestDownloadRemote(t *testing.T) {
-	contextDir := fs.NewDir(t, "test-builder-download-remote",
-		fs.WithFile(builder.DefaultDockerfileName, dockerfileContents))
-	defer contextDir.Remove()
+	contextDir := t.TempDir()
+	createTestTempFile(t, contextDir, builder.DefaultDockerfileName, dockerfileContents, 0644)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -184,19 +182,19 @@ func TestDownloadRemote(t *testing.T) {
 	serverURL.Path = "/" + builder.DefaultDockerfileName
 	remoteURL := serverURL.String()
 
-	mux.Handle("/", http.FileServer(http.Dir(contextDir.Path())))
+	mux.Handle("/", http.FileServer(http.Dir(contextDir)))
 
 	contentType, content, err := downloadRemote(remoteURL)
 	assert.NilError(t, err)
 
-	assert.Check(t, is.Equal(mimeTypes.TextPlain, contentType))
+	assert.Check(t, is.Equal(mimeTypeTextPlain, contentType))
 	raw, err := io.ReadAll(content)
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(dockerfileContents, string(raw)))
 }
 
 func TestGetWithStatusError(t *testing.T) {
-	var testcases = []struct {
+	testcases := []struct {
 		err          error
 		statusCode   int
 		expectedErr  string

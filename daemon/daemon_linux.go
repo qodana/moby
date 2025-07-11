@@ -1,22 +1,24 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/libnetwork/ns"
 	"github.com/docker/docker/libnetwork/resolvconf"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // On Linux, plugins use a static path for storing execution state,
@@ -28,7 +30,7 @@ func getPluginExecRoot(_ *config.Config) string {
 }
 
 func (daemon *Daemon) cleanupMountsByID(id string) error {
-	logrus.Debugf("Cleaning up old mountid %s: start.", id)
+	log.G(context.TODO()).Debugf("Cleaning up old mountid %s: start.", id)
 	f, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
 		return err
@@ -52,7 +54,7 @@ func (daemon *Daemon) cleanupMountsFromReaderByID(reader io.Reader, id string, u
 				for _, p := range regexps {
 					if p.MatchString(mnt) {
 						if err := unmount(mnt); err != nil {
-							logrus.Error(err)
+							log.G(context.TODO()).Error(err)
 							errs = append(errs, err.Error())
 						}
 					}
@@ -69,12 +71,12 @@ func (daemon *Daemon) cleanupMountsFromReaderByID(reader io.Reader, id string, u
 		return fmt.Errorf("Error cleaning up mounts:\n%v", strings.Join(errs, "\n"))
 	}
 
-	logrus.Debugf("Cleaning up old mountid %v: done.", id)
+	log.G(context.TODO()).Debugf("Cleaning up old mountid %v: done.", id)
 	return nil
 }
 
 // cleanupMounts umounts used by container resources and the daemon root mount
-func (daemon *Daemon) cleanupMounts() error {
+func (daemon *Daemon) cleanupMounts(cfg *config.Config) error {
 	if err := daemon.cleanupMountsByID(""); err != nil {
 		return err
 	}
@@ -90,7 +92,7 @@ func (daemon *Daemon) cleanupMounts() error {
 	}
 
 	// `info.Root` here is the root mountpoint of the passed in path (`daemon.root`).
-	// The ony cases that need to be cleaned up is when the daemon has performed a
+	// The only cases that need to be cleaned up is when the daemon has performed a
 	//   `mount --bind /daemon/root /daemon/root && mount --make-shared /daemon/root`
 	// This is only done when the daemon is started up and `/daemon/root` is not
 	// already on a shared mountpoint.
@@ -98,32 +100,34 @@ func (daemon *Daemon) cleanupMounts() error {
 		return nil
 	}
 
-	unmountFile := getUnmountOnShutdownPath(daemon.configStore)
+	unmountFile := getUnmountOnShutdownPath(cfg)
 	if _, err := os.Stat(unmountFile); err != nil {
 		return nil
 	}
 
-	logrus.WithField("mountpoint", daemon.root).Debug("unmounting daemon root")
+	log.G(context.TODO()).WithField("mountpoint", daemon.root).Debug("unmounting daemon root")
 	if err := mount.Unmount(daemon.root); err != nil {
 		return err
 	}
 	return os.Remove(unmountFile)
 }
 
-func getCleanPatterns(id string) (regexps []*regexp.Regexp) {
+func getCleanPatterns(id string) []*regexp.Regexp {
 	var patterns []string
 	if id == "" {
 		id = "[0-9a-f]{64}"
 		patterns = append(patterns, "containers/"+id+"/mounts/shm", "containers/"+id+"/shm")
 	}
 	patterns = append(patterns, "overlay2/"+id+"/merged$", "zfs/graph/"+id+"$")
+
+	var regexps []*regexp.Regexp
 	for _, p := range patterns {
 		r, err := regexp.Compile(p)
 		if err == nil {
 			regexps = append(regexps, r)
 		}
 	}
-	return
+	return regexps
 }
 
 func shouldUnmountRoot(root string, info *mountinfo.Info) bool {
@@ -145,40 +149,91 @@ func setupResolvConf(config *config.Config) {
 	config.ResolvConf = resolvconf.Path()
 }
 
-// ifaceAddrs returns the IPv4 and IPv6 addresses assigned to the network
+// ifaceAddrs returns the addresses from family assigned to the network
 // interface with name linkName.
 //
 // No error is returned if the named interface does not exist.
-func ifaceAddrs(linkName string) (v4, v6 []*net.IPNet, err error) {
+func ifaceAddrs(linkName string, family int) ([]netlink.Addr, error) {
 	nl := ns.NlHandle()
 	link, err := nl.LinkByName(linkName)
 	if err != nil {
 		if !errors.As(err, new(netlink.LinkNotFoundError)) {
-			return nil, nil, err
-		}
-		return nil, nil, nil
-	}
-
-	get := func(family int) ([]*net.IPNet, error) {
-		addrs, err := nl.AddrList(link, family)
-		if err != nil {
 			return nil, err
 		}
+		return nil, nil
+	}
+	return nl.AddrList(link, family)
+}
 
-		ipnets := make([]*net.IPNet, len(addrs))
-		for i := range addrs {
-			ipnets[i] = addrs[i].IPNet
+var (
+	kernelSupportsRROOnce sync.Once
+	kernelSupportsRROErr  error
+)
+
+func kernelSupportsRecursivelyReadOnly() error {
+	fn := func() error {
+		tmpMnt, err := os.MkdirTemp("", "moby-detect-rro")
+		if err != nil {
+			return fmt.Errorf("failed to create a temp directory: %w", err)
 		}
-		return ipnets, nil
+		for {
+			err = unix.Mount("", tmpMnt, "tmpfs", 0, "")
+			if !errors.Is(err, unix.EINTR) {
+				break
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("failed to mount tmpfs on %q: %w", tmpMnt, err)
+		}
+		defer func() {
+			var umErr error
+			for {
+				umErr = unix.Unmount(tmpMnt, 0)
+				if !errors.Is(umErr, unix.EINTR) {
+					break
+				}
+			}
+			if umErr != nil {
+				log.G(context.TODO()).WithError(umErr).Warnf("Failed to unmount %q", tmpMnt)
+			}
+		}()
+		attr := &unix.MountAttr{
+			Attr_set: unix.MOUNT_ATTR_RDONLY,
+		}
+		for {
+			err = unix.MountSetattr(-1, tmpMnt, unix.AT_RECURSIVE, attr)
+			if !errors.Is(err, unix.EINTR) {
+				break
+			}
+		}
+		// ENOSYS on kernel < 5.12
+		if err != nil {
+			return fmt.Errorf("failed to call mount_setattr: %w", err)
+		}
+		return nil
 	}
 
-	v4, err = get(netlink.FAMILY_V4)
-	if err != nil {
-		return nil, nil, err
+	kernelSupportsRROOnce.Do(func() {
+		kernelSupportsRROErr = fn()
+	})
+	return kernelSupportsRROErr
+}
+
+func supportsRecursivelyReadOnly(cfg *configStore, runtime string) error {
+	if err := kernelSupportsRecursivelyReadOnly(); err != nil {
+		return fmt.Errorf("rro is not supported: %w (kernel is older than 5.12?)", err)
 	}
-	v6, err = get(netlink.FAMILY_V6)
-	if err != nil {
-		return nil, nil, err
+	if runtime == "" {
+		runtime = cfg.Runtimes.Default
 	}
-	return v4, v6, nil
+	features := cfg.Runtimes.Features(runtime)
+	if features == nil {
+		return fmt.Errorf("rro is not supported by runtime %q: OCI features struct is not available", runtime)
+	}
+	for _, s := range features.MountOptions {
+		if s == "rro" {
+			return nil
+		}
+	}
+	return fmt.Errorf("rro is not supported by runtime %q", runtime)
 }

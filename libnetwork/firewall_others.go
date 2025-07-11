@@ -1,7 +1,7 @@
 //go:build !linux
-// +build !linux
 
 package libnetwork
 
-func setupArrangeUserFilterRule(c *Controller) {}
-func arrangeUserFilterRule()                   {}
+func (c *Controller) selectFirewallBackend() {}
+
+func (c *Controller) setupUserChains() {}

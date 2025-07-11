@@ -2,6 +2,8 @@ package solver
 
 import (
 	"context"
+	"errors"
+	"slices"
 
 	digest "github.com/opencontainers/go-digest"
 )
@@ -85,8 +87,9 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		r        CacheExporterRecord
 		selector digest.Digest
 	}
+	k := e.k.clone() // protect against *CacheKey internal ids mutation from other exports
 
-	recKey := rootKey(e.k.Digest(), e.k.Output())
+	recKey := rootKey(k.Digest(), k.Output())
 	rec := t.Add(recKey)
 	allRec := []CacheExporterRecord{rec}
 
@@ -97,22 +100,33 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 	}
 
 	exportRecord := opt.ExportRoots
-	if len(e.k.Deps()) > 0 {
+	if len(deps) > 0 {
 		exportRecord = true
 	}
 
-	if e.record == nil && exportRecord {
-		e.record = getBestResult(e.records)
-	}
+	records := slices.Clone(e.records)
+	slices.SortStableFunc(records, compareCacheRecord)
 
 	var remote *Remote
-	if v := e.record; v != nil && exportRecord && addRecord {
+	var i int
+	for exportRecord && addRecord {
 		var variants []CacheExporterRecord
-
+		v := e.record
+		if v == nil {
+			if i < len(records) {
+				v = records[i]
+				i++
+			} else {
+				break
+			}
+		}
 		cm := v.cacheManager
 		key := cm.getID(v.key)
 		res, err := cm.backend.Load(key, v.ID)
 		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
 			return nil, err
 		}
 
@@ -126,7 +140,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 		if opt.CompressionOpt != nil {
 			for _, r := range remotes { // record all remaining remotes as well
 				rec := t.Add(recKey)
-				rec.AddResult(e.k.vtx, int(e.k.output), v.CreatedAt, r)
+				rec.AddResult(k.vtx, int(k.output), v.CreatedAt, r)
 				variants = append(variants, rec)
 			}
 		}
@@ -147,7 +161,7 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			if opt.CompressionOpt != nil {
 				for _, r := range remotes { // record all remaining remotes as well
 					rec := t.Add(recKey)
-					rec.AddResult(e.k.vtx, int(e.k.output), v.CreatedAt, r)
+					rec.AddResult(k.vtx, int(k.output), v.CreatedAt, r)
 					variants = append(variants, rec)
 				}
 			}
@@ -155,10 +169,11 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 
 		if remote != nil {
 			for _, rec := range allRec {
-				rec.AddResult(e.k.vtx, int(e.k.output), v.CreatedAt, remote)
+				rec.AddResult(k.vtx, int(k.output), v.CreatedAt, remote)
 			}
 		}
 		allRec = append(allRec, variants...)
+		break
 	}
 
 	if remote != nil && opt.Mode == CacheExportModeMin {
@@ -198,9 +213,11 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 			}
 		}
 
-		for cm, id := range e.k.ids {
-			if _, err := addBacklinks(t, rec, cm, id, bkm); err != nil {
-				return nil, err
+		if !opt.IgnoreBacklinks {
+			for cm, id := range k.ids {
+				if _, err := addBacklinks(t, rec, cm, id, bkm); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -225,13 +242,28 @@ func (e *exporter) ExportTo(ctx context.Context, t CacheExporterTarget, opt Cach
 }
 
 func getBestResult(records []*CacheRecord) *CacheRecord {
-	var rec *CacheRecord
-	for _, r := range records {
-		if rec == nil || rec.CreatedAt.Before(r.CreatedAt) || (rec.CreatedAt.Equal(r.CreatedAt) && rec.Priority < r.Priority) {
-			rec = r
-		}
+	records = slices.Clone(records)
+	slices.SortStableFunc(records, compareCacheRecord)
+	if len(records) == 0 {
+		return nil
 	}
-	return rec
+	return records[0]
+}
+
+func compareCacheRecord(a, b *CacheRecord) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	if v := b.CreatedAt.Compare(a.CreatedAt); v != 0 {
+		return v
+	}
+	return a.Priority - b.Priority
 }
 
 type mergedExporter struct {

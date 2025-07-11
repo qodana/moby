@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -9,28 +9,35 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/container"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerRemoveError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	err := client.ContainerRemove(context.Background(), "container_id", types.ContainerRemoveOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	err := client.ContainerRemove(context.Background(), "container_id", container.RemoveOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	err = client.ContainerRemove(context.Background(), "", container.RemoveOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	err = client.ContainerRemove(context.Background(), "    ", container.RemoveOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerRemoveNotFoundError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusNotFound, "no such container: container_id")),
 	}
-	err := client.ContainerRemove(context.Background(), "container_id", types.ContainerRemoveOptions{})
-	assert.ErrorContains(t, err, "no such container: container_id")
-	assert.Check(t, IsErrNotFound(err))
+	err := client.ContainerRemove(context.Background(), "container_id", container.RemoveOptions{})
+	assert.Check(t, is.ErrorContains(err, "no such container: container_id"))
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }
 
 func TestContainerRemove(t *testing.T) {
@@ -60,9 +67,9 @@ func TestContainerRemove(t *testing.T) {
 		}),
 	}
 
-	err := client.ContainerRemove(context.Background(), "container_id", types.ContainerRemoveOptions{
+	err := client.ContainerRemove(context.Background(), "container_id", container.RemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
 	})
-	assert.Check(t, err)
+	assert.NilError(t, err)
 }

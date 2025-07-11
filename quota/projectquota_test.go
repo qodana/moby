@@ -1,9 +1,9 @@
 //go:build linux
-// +build linux
 
-package quota // import "github.com/docker/docker/quota"
+package quota
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -50,7 +50,7 @@ func testBlockDevQuotaEnabled(t *testing.T, mountPoint, backingFsDev, testDir st
 func testSmallerThanQuota(t *testing.T, ctrl *Control, homeDir, testDir, testSubDir string) {
 	assert.NilError(t, ctrl.SetQuota(testSubDir, Quota{testQuotaSize}))
 	smallerThanQuotaFile := filepath.Join(testSubDir, "smaller-than-quota")
-	assert.NilError(t, os.WriteFile(smallerThanQuotaFile, make([]byte, testQuotaSize/2), 0644))
+	assert.NilError(t, os.WriteFile(smallerThanQuotaFile, make([]byte, testQuotaSize/2), 0o644))
 	assert.NilError(t, os.Remove(smallerThanQuotaFile))
 }
 
@@ -61,9 +61,9 @@ func testBiggerThanQuota(t *testing.T, ctrl *Control, homeDir, testDir, testSubD
 	assert.NilError(t, ctrl.SetQuota(testSubDir, Quota{testQuotaSize}))
 
 	biggerThanQuotaFile := filepath.Join(testSubDir, "bigger-than-quota")
-	err := os.WriteFile(biggerThanQuotaFile, make([]byte, testQuotaSize+1), 0644)
-	assert.Assert(t, is.ErrorContains(err, ""))
-	if err == io.ErrShortWrite {
+	err := os.WriteFile(biggerThanQuotaFile, make([]byte, testQuotaSize+1), 0o644)
+	assert.ErrorContains(t, err, "")
+	if errors.Is(err, io.ErrShortWrite) {
 		assert.NilError(t, os.Remove(biggerThanQuotaFile))
 	}
 }

@@ -1,18 +1,20 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/errdefs"
-	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestNodeInspectError(t *testing.T) {
@@ -21,9 +23,7 @@ func TestNodeInspectError(t *testing.T) {
 	}
 
 	_, _, err := client.NodeInspectWithRaw(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestNodeInspectNodeNotFound(t *testing.T) {
@@ -32,9 +32,7 @@ func TestNodeInspectNodeNotFound(t *testing.T) {
 	}
 
 	_, _, err := client.NodeInspectWithRaw(context.Background(), "unknown")
-	if err == nil || !IsErrNotFound(err) {
-		t.Fatalf("expected a nodeNotFoundError error, got %v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }
 
 func TestNodeInspectWithEmptyID(t *testing.T) {
@@ -44,9 +42,12 @@ func TestNodeInspectWithEmptyID(t *testing.T) {
 		}),
 	}
 	_, _, err := client.NodeInspectWithRaw(context.Background(), "")
-	if !IsErrNotFound(err) {
-		t.Fatalf("Expected NotFoundError, got %v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, _, err = client.NodeInspectWithRaw(context.Background(), "    ")
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestNodeInspect(t *testing.T) {
@@ -70,10 +71,6 @@ func TestNodeInspect(t *testing.T) {
 	}
 
 	nodeInspect, _, err := client.NodeInspectWithRaw(context.Background(), "node_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nodeInspect.ID != "node_id" {
-		t.Fatalf("expected `node_id`, got %s", nodeInspect.ID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(nodeInspect.ID, "node_id"))
 }

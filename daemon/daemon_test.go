@@ -1,14 +1,15 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/daemon/container"
 	"github.com/docker/docker/libnetwork"
 	"github.com/docker/docker/pkg/idtools"
 	volumesservice "github.com/docker/docker/volume/service"
@@ -150,7 +151,7 @@ func TestContainerInitDNS(t *testing.T) {
 
 	containerID := "d59df5276e7b219d510fe70565e0404bc06350e0d4b43fe961f22f339980170e"
 	containerPath := filepath.Join(tmp, containerID)
-	if err := os.MkdirAll(containerPath, 0755); err != nil {
+	if err := os.MkdirAll(containerPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,7 +177,7 @@ func TestContainerInitDNS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(configPath, []byte(config), 0644); err != nil {
+	if err = os.WriteFile(configPath, []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,7 +190,7 @@ func TestContainerInitDNS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(hostConfigPath, []byte(hostConfig), 0644); err != nil {
+	if err = os.WriteFile(hostConfigPath, []byte(hostConfig), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -300,7 +301,7 @@ func TestMerge(t *testing.T) {
 func TestValidateContainerIsolation(t *testing.T) {
 	d := Daemon{}
 
-	_, err := d.verifyContainerSettings(&containertypes.HostConfig{Isolation: containertypes.Isolation("invalid")}, nil, false)
+	_, err := d.verifyContainerSettings(&configStore{}, &containertypes.HostConfig{Isolation: containertypes.Isolation("invalid")}, nil, false)
 	assert.Check(t, is.Error(err, "invalid isolation 'invalid' on "+runtime.GOOS))
 }
 
@@ -309,7 +310,34 @@ func TestFindNetworkErrorType(t *testing.T) {
 	_, err := d.FindNetwork("fakeNet")
 	var nsn libnetwork.ErrNoSuchNetwork
 	ok := errors.As(err, &nsn)
-	if !errdefs.IsNotFound(err) || !ok {
+	if !cerrdefs.IsNotFound(err) || !ok {
 		t.Error("The FindNetwork method MUST always return an error that implements the NotFound interface and is ErrNoSuchNetwork")
+	}
+}
+
+// TestDeriveULABaseNetwork checks that for a given hostID, the derived prefix is stable over time.
+func TestDeriveULABaseNetwork(t *testing.T) {
+	testcases := []struct {
+		name      string
+		hostID    string
+		expPrefix netip.Prefix
+	}{
+		{
+			name:      "Empty hostID",
+			expPrefix: netip.MustParsePrefix("fd42:98fc:1c14::/48"),
+		},
+		{
+			name:      "499d4bc0-b0b3-416f-b1ee-cf6486315593",
+			hostID:    "499d4bc0-b0b3-416f-b1ee-cf6486315593",
+			expPrefix: netip.MustParsePrefix("fd62:fb69:18af::/48"),
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			nw := deriveULABaseNetwork(tc.hostID)
+			assert.Equal(t, nw.Base, tc.expPrefix)
+			assert.Equal(t, nw.Size, 64)
+		})
 	}
 }

@@ -1,7 +1,6 @@
 //go:build linux
-// +build linux
 
-package gelf // import "github.com/docker/docker/daemon/logger/gelf"
+package gelf
 
 import (
 	"net"

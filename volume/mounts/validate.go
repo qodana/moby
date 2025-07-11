@@ -1,4 +1,4 @@
-package mounts // import "github.com/docker/docker/volume/mounts"
+package mounts
 
 import (
 	"fmt"
@@ -23,6 +23,7 @@ func errBindSourceDoesNotExist(path string) error {
 func errExtraField(name string) error {
 	return errors.Errorf("field %s must not be specified", name)
 }
+
 func errMissingField(name string) error {
 	return errors.Errorf("field %s must not be empty", name)
 }

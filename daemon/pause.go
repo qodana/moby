@@ -1,11 +1,12 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/docker/docker/container"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/daemon/container"
 )
 
 // ContainerPause pauses a container
@@ -46,10 +47,10 @@ func (daemon *Daemon) containerPause(container *container.Container) error {
 	container.Paused = true
 	daemon.setStateCounter(container)
 	daemon.updateHealthMonitor(container)
-	daemon.LogContainerEvent(container, "pause")
+	daemon.LogContainerEvent(container, events.ActionPause)
 
-	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
-		logrus.WithError(err).Warn("could not save container to disk")
+	if err := container.CheckpointTo(context.WithoutCancel(context.TODO()), daemon.containersReplica); err != nil {
+		log.G(context.TODO()).WithError(err).Warn("could not save container to disk")
 	}
 
 	return nil

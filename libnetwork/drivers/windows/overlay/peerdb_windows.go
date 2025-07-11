@@ -1,23 +1,21 @@
 package overlay
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
-
-	"encoding/json"
-
-	"github.com/docker/docker/libnetwork/types"
-	"github.com/sirupsen/logrus"
+	"net/http"
 
 	"github.com/Microsoft/hcsshim"
+	"github.com/containerd/log"
+	"github.com/docker/docker/libnetwork/types"
 )
 
 const ovPeerTable = "overlay_peer_table"
 
-func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
-	peerMac net.HardwareAddr, vtep net.IP, updateDb bool) error {
-
-	logrus.Debugf("WINOVERLAY: Enter peerAdd for ca ip %s with ca mac %s", peerIP.String(), peerMac.String())
+func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask, peerMac net.HardwareAddr, vtep net.IP, updateDb bool) error {
+	log.G(context.TODO()).Debugf("WINOVERLAY: Enter peerAdd for ca ip %s with ca mac %s", peerIP.String(), peerMac.String())
 
 	if err := validateID(nid, eid); err != nil {
 		return err
@@ -29,7 +27,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 	}
 
 	if updateDb {
-		logrus.Info("WINOVERLAY: peerAdd: notifying HNS of the REMOTE endpoint")
+		log.G(context.TODO()).Info("WINOVERLAY: peerAdd: notifying HNS of the REMOTE endpoint")
 
 		hnsEndpoint := &hcsshim.HNSEndpoint{
 			Name:             eid,
@@ -43,7 +41,6 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 			Type: "PA",
 			PA:   vtep.String(),
 		})
-
 		if err != nil {
 			return err
 		}
@@ -67,7 +64,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 		}
 
 		n.removeEndpointWithAddress(addr)
-		hnsresponse, err := endpointRequest("POST", "", string(configurationb))
+		hnsresponse, err := hcsshim.HNSEndpointRequest(http.MethodPost, "", string(configurationb))
 		if err != nil {
 			return err
 		}
@@ -87,10 +84,8 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 	return nil
 }
 
-func (d *driver) peerDelete(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
-	peerMac net.HardwareAddr, vtep net.IP, updateDb bool) error {
-
-	logrus.Infof("WINOVERLAY: Enter peerDelete for endpoint %s and peer ip %s", eid, peerIP.String())
+func (d *driver) peerDelete(nid, eid string, peerIP net.IP, peerIPMask net.IPMask, peerMac net.HardwareAddr, vtep net.IP, updateDb bool) error {
+	log.G(context.TODO()).Infof("WINOVERLAY: Enter peerDelete for endpoint %s and peer ip %s", eid, peerIP.String())
 
 	if err := validateID(nid, eid); err != nil {
 		return err
@@ -107,7 +102,7 @@ func (d *driver) peerDelete(nid, eid string, peerIP net.IP, peerIPMask net.IPMas
 	}
 
 	if updateDb {
-		_, err := endpointRequest("DELETE", ep.profileID, "")
+		_, err := hcsshim.HNSEndpointRequest(http.MethodDelete, ep.profileID, "")
 		if err != nil {
 			return err
 		}

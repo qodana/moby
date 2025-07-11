@@ -1,4 +1,4 @@
-package urlutil // import "github.com/docker/docker/builder/remotecontext/urlutil"
+package urlutil
 
 import "testing"
 
@@ -17,6 +17,7 @@ var (
 	}
 	invalidGitUrls = []string{
 		"http://github.com/docker/docker.git:#branch",
+		"https://github.com/docker/dgit",
 	}
 )
 

@@ -1,19 +1,21 @@
 package overlay
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/Microsoft/hcsshim"
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/portmapper"
 	"github.com/docker/docker/libnetwork/types"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -59,7 +61,7 @@ func (d *driver) NetworkFree(id string) error {
 	return types.NotImplementedErrorf("not implemented")
 }
 
-func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
+func (d *driver) CreateNetwork(ctx context.Context, id string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	var (
 		networkName   string
 		interfaceName string
@@ -75,7 +77,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 	}
 
 	if len(ipV4Data) == 0 || ipV4Data[0].Pool.String() == "0.0.0.0/0" {
-		return types.BadRequestErrorf("ipv4 pool is empty")
+		return types.InvalidParameterErrorf("ipv4 pool is empty")
 	}
 
 	staleNetworks = make([]string, 0)
@@ -83,10 +85,10 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 
 	existingNetwork := d.network(id)
 	if existingNetwork != nil {
-		logrus.Debugf("Network preexists. Deleting %s", id)
+		log.G(ctx).Debugf("Network preexists. Deleting %s", id)
 		err := d.DeleteNetwork(id)
 		if err != nil {
-			logrus.Errorf("Error deleting stale network %s", err.Error())
+			log.G(ctx).Errorf("Error deleting stale network %s", err.Error())
 		}
 	}
 
@@ -95,7 +97,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 		driver:     d,
 		endpoints:  endpointTable{},
 		subnets:    []*subnet{},
-		portMapper: portmapper.New(""),
+		portMapper: portmapper.New(),
 	}
 
 	genData, ok := option[netlabel.GenericData].(map[string]string)
@@ -200,21 +202,13 @@ func (d *driver) DeleteNetwork(nid string) error {
 		return types.ForbiddenErrorf("could not find network with id %s", nid)
 	}
 
-	_, err := hcsshim.HNSNetworkRequest("DELETE", n.hnsID, "")
+	_, err := hcsshim.HNSNetworkRequest(http.MethodDelete, n.hnsID, "")
 	if err != nil {
-		return types.ForbiddenErrorf(err.Error())
+		return types.ForbiddenErrorf("%v", err)
 	}
 
 	d.deleteNetwork(nid)
 
-	return nil
-}
-
-func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
-	return nil
-}
-
-func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
 	return nil
 }
 
@@ -237,9 +231,9 @@ func (d *driver) network(nid string) *network {
 }
 
 // func (n *network) restoreNetworkEndpoints() error {
-// 	logrus.Infof("Restoring endpoints for overlay network: %s", n.id)
+// 	log.G(ctx).Infof("Restoring endpoints for overlay network: %s", n.id)
 
-// 	hnsresponse, err := hcsshim.HNSListEndpointRequest("GET", "", "")
+// 	hnsresponse, err := hcsshim.HNSListEndpointRequest(http.MethodGet, "", "")
 // 	if err != nil {
 // 		return err
 // 	}
@@ -252,7 +246,7 @@ func (d *driver) network(nid string) *network {
 // 		ep := n.convertToOverlayEndpoint(&endpoint)
 
 // 		if ep != nil {
-// 			logrus.Debugf("Restored endpoint:%s Remote:%t", ep.id, ep.remote)
+// 			log.G(ctx).Debugf("Restored endpoint:%s Remote:%t", ep.id, ep.remote)
 // 			n.addEndpoint(ep)
 // 		}
 // 	}
@@ -269,7 +263,6 @@ func (n *network) convertToOverlayEndpoint(v *hcsshim.HNSEndpoint) *endpoint {
 	}
 
 	mac, err := net.ParseMAC(v.MacAddress)
-
 	if err != nil {
 		return nil
 	}
@@ -284,7 +277,6 @@ func (n *network) convertToOverlayEndpoint(v *hcsshim.HNSEndpoint) *endpoint {
 }
 
 func (d *driver) createHnsNetwork(n *network) error {
-
 	subnets := []hcsshim.Subnet{}
 
 	for _, s := range n.subnets {
@@ -300,7 +292,6 @@ func (d *driver) createHnsNetwork(n *network) error {
 			Type: "VSID",
 			VSID: uint(s.vni),
 		})
-
 		if err != nil {
 			return err
 		}
@@ -323,9 +314,9 @@ func (d *driver) createHnsNetwork(n *network) error {
 	}
 
 	configuration := string(configurationb)
-	logrus.Infof("HNSNetwork Request =%v", configuration)
+	log.G(context.TODO()).Infof("HNSNetwork Request =%v", configuration)
 
-	hnsresponse, err := hcsshim.HNSNetworkRequest("POST", "", configuration)
+	hnsresponse, err := hcsshim.HNSNetworkRequest(http.MethodPost, "", configuration)
 	if err != nil {
 		return err
 	}

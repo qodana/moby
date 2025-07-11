@@ -19,13 +19,11 @@ import (
 func TestLocalVolumeSize(t *testing.T) {
 	t.Parallel()
 
-	ds := volumedrivers.NewStore(nil)
-	dir, err := os.MkdirTemp("", t.Name())
+	tmpDir := t.TempDir()
+	l, err := local.New(tmpDir, idtools.Identity{UID: os.Getuid(), GID: os.Getegid()})
 	assert.NilError(t, err)
-	defer os.RemoveAll(dir)
 
-	l, err := local.New(dir, idtools.Identity{UID: os.Getuid(), GID: os.Getegid()})
-	assert.NilError(t, err)
+	ds := volumedrivers.NewStore(nil)
 	assert.Assert(t, ds.Register(l, volume.DefaultDriverName))
 	assert.Assert(t, ds.Register(testutils.NewFakeDriver("fake"), "fake"))
 
@@ -41,9 +39,9 @@ func TestLocalVolumeSize(t *testing.T) {
 	assert.NilError(t, err)
 
 	data := make([]byte, 1024)
-	err = os.WriteFile(filepath.Join(v1.Mountpoint, "data"), data, 0644)
+	err = os.WriteFile(filepath.Join(v1.Mountpoint, "data"), data, 0o644)
 	assert.NilError(t, err)
-	err = os.WriteFile(filepath.Join(v2.Mountpoint, "data"), data[:1], 0644)
+	err = os.WriteFile(filepath.Join(v2.Mountpoint, "data"), data[:1], 0o644)
 	assert.NilError(t, err)
 
 	ls, err := service.LocalVolumesSize(ctx)

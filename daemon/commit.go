@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
@@ -7,10 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/builder/dockerfile"
+	"github.com/docker/docker/daemon/internal/metrics"
 	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
 )
@@ -92,6 +94,9 @@ func merge(userConf, imageConf *containertypes.Config) error {
 			if userConf.Healthcheck.StartPeriod == 0 {
 				userConf.Healthcheck.StartPeriod = imageConf.Healthcheck.StartPeriod
 			}
+			if userConf.Healthcheck.StartInterval == 0 {
+				userConf.Healthcheck.StartInterval = imageConf.Healthcheck.StartInterval
+			}
 			if userConf.Healthcheck.Retries == 0 {
 				userConf.Healthcheck.Retries = imageConf.Healthcheck.Retries
 			}
@@ -132,13 +137,11 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 	}
 
 	if container.IsDead() {
-		err := fmt.Errorf("You cannot commit container %s which is Dead", container.ID)
-		return "", errdefs.Conflict(err)
+		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is Dead", container.ID))
 	}
 
 	if container.IsRemovalInProgress() {
-		err := fmt.Errorf("You cannot commit container %s which is being removed", container.ID)
-		return "", errdefs.Conflict(err)
+		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is being removed", container.ID))
 	}
 
 	if c.Pause && !container.IsPaused() {
@@ -149,7 +152,7 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 	if c.Config == nil {
 		c.Config = container.Config
 	}
-	newConfig, err := dockerfile.BuildFromConfig(ctx, c.Config, c.Changes, container.OS)
+	newConfig, err := dockerfile.BuildFromConfig(ctx, c.Config, c.Changes, container.ImagePlatform.OS)
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +167,7 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 		ContainerConfig:     container.Config,
 		ContainerID:         container.ID,
 		ContainerMountLabel: container.MountLabel,
-		ContainerOS:         container.OS,
+		ContainerOS:         container.ImagePlatform.OS,
 		ParentImageID:       string(container.ImageID),
 	})
 	if err != nil {
@@ -179,11 +182,11 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 		}
 		imageRef = reference.FamiliarString(c.Tag)
 	}
-	daemon.LogContainerEventWithAttributes(container, "commit", map[string]string{
+	daemon.LogContainerEventWithAttributes(container, events.ActionCommit, map[string]string{
 		"comment":  c.Comment,
 		"imageID":  id.String(),
 		"imageRef": imageRef,
 	})
-	containerActions.WithValues("commit").UpdateSince(start)
+	metrics.ContainerActions.WithValues("commit").UpdateSince(start)
 	return id.String(), nil
 }

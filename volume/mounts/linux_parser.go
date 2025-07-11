@@ -1,4 +1,4 @@
-package mounts // import "github.com/docker/docker/volume/mounts"
+package mounts
 
 import (
 	"errors"
@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/volume"
 )
 
@@ -30,6 +29,7 @@ func linuxValidateNotRoot(p string) error {
 	}
 	return nil
 }
+
 func linuxValidateAbsolute(p string) error {
 	p = strings.ReplaceAll(p, `\`, `/`)
 	if path.IsAbs(p) {
@@ -37,14 +37,16 @@ func linuxValidateAbsolute(p string) error {
 	}
 	return fmt.Errorf("invalid mount path: '%s' mount path must be absolute", p)
 }
+
 func (p *linuxParser) ValidateMountConfig(mnt *mount.Mount) error {
 	// there was something looking like a bug in existing codebase:
 	// - validateMountConfig on linux was called with options skipping bind source existence when calling ParseMountRaw
 	// - but not when calling ParseMountSpec directly... nor when the unit test called it directly
 	return p.validateMountConfigImpl(mnt, true)
 }
+
 func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSourceExists bool) error {
-	if len(mnt.Target) == 0 {
+	if mnt.Target == "" {
 		return &errMountConfig{mnt, errMissingField("Target")}
 	}
 
@@ -58,7 +60,7 @@ func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSour
 
 	switch mnt.Type {
 	case mount.TypeBind:
-		if len(mnt.Source) == 0 {
+		if mnt.Source == "" {
 			return &errMountConfig{mnt, errMissingField("Source")}
 		}
 		// Don't error out just because the propagation mode is not supported on the platform
@@ -72,6 +74,9 @@ func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSour
 		if mnt.VolumeOptions != nil {
 			return &errMountConfig{mnt, errExtraField("VolumeOptions")}
 		}
+		if mnt.ImageOptions != nil {
+			return &errMountConfig{mnt, errExtraField("ImageOptions")}
+		}
 
 		if err := linuxValidateAbsolute(mnt.Source); err != nil {
 			return &errMountConfig{mnt, err}
@@ -82,7 +87,9 @@ func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSour
 			if err != nil {
 				return &errMountConfig{mnt, err}
 			}
-			if !exists {
+
+			createMountpoint := mnt.BindOptions != nil && mnt.BindOptions.CreateMountpoint
+			if !exists && !createMountpoint {
 				return &errMountConfig{mnt, errBindSourceDoesNotExist(mnt.Source)}
 			}
 		}
@@ -91,19 +98,50 @@ func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSour
 		if mnt.BindOptions != nil {
 			return &errMountConfig{mnt, errExtraField("BindOptions")}
 		}
+		if mnt.ImageOptions != nil {
+			return &errMountConfig{mnt, errExtraField("ImageOptions")}
+		}
+		anonymousVolume := mnt.Source == ""
 
-		if len(mnt.Source) == 0 && mnt.ReadOnly {
-			return &errMountConfig{mnt, fmt.Errorf("must not set ReadOnly mode when using anonymous volumes")}
+		if mnt.VolumeOptions != nil && mnt.VolumeOptions.Subpath != "" {
+			if anonymousVolume {
+				return &errMountConfig{mnt, errAnonymousVolumeWithSubpath}
+			}
+
+			if !filepath.IsLocal(mnt.VolumeOptions.Subpath) {
+				return &errMountConfig{mnt, errInvalidSubpath}
+			}
+		}
+		if mnt.ReadOnly && anonymousVolume {
+			return &errMountConfig{mnt, errors.New("must not set ReadOnly mode when using anonymous volumes")}
 		}
 	case mount.TypeTmpfs:
 		if mnt.BindOptions != nil {
 			return &errMountConfig{mnt, errExtraField("BindOptions")}
 		}
-		if len(mnt.Source) != 0 {
+		if mnt.ImageOptions != nil {
+			return &errMountConfig{mnt, errExtraField("ImageOptions")}
+		}
+		if mnt.Source != "" {
 			return &errMountConfig{mnt, errExtraField("Source")}
 		}
 		if _, err := p.ConvertTmpfsOptions(mnt.TmpfsOptions, mnt.ReadOnly); err != nil {
 			return &errMountConfig{mnt, err}
+		}
+	case mount.TypeImage:
+		if mnt.BindOptions != nil {
+			return &errMountConfig{mnt, errExtraField("BindOptions")}
+		}
+		if mnt.VolumeOptions != nil {
+			return &errMountConfig{mnt, errExtraField("VolumeOptions")}
+		}
+		if mnt.Source == "" {
+			return &errMountConfig{mnt, errMissingField("Source")}
+		}
+		if mnt.ImageOptions != nil && mnt.ImageOptions.Subpath != "" {
+			if !filepath.IsLocal(mnt.ImageOptions.Subpath) {
+				return &errMountConfig{mnt, errInvalidSubpath}
+			}
 		}
 	default:
 		return &errMountConfig{mnt, errors.New("mount type unknown")}
@@ -123,6 +161,7 @@ var linuxConsistencyModes = map[mount.Consistency]bool{
 	mount.ConsistencyCached:    true,
 	mount.ConsistencyDelegated: true,
 }
+
 var linuxPropagationModes = map[mount.Propagation]bool{
 	mount.PropagationPrivate:  true,
 	mount.PropagationRPrivate: true,
@@ -186,6 +225,30 @@ func linuxValidMountMode(mode string) bool {
 		return false
 	}
 	return true
+}
+
+var validTmpfsOptions = map[string]bool{
+	"exec":   true,
+	"noexec": true,
+}
+
+func validateTmpfsOptions(rawOptions [][]string) ([]string, error) {
+	var options []string
+	for _, opt := range rawOptions {
+		if len(opt) < 1 || len(opt) > 2 {
+			return nil, errors.New("invalid option array length")
+		}
+		if _, ok := validTmpfsOptions[opt[0]]; !ok {
+			return nil, errors.New("invalid option: " + opt[0])
+		}
+
+		if len(opt) == 1 {
+			options = append(options, opt[0])
+		} else {
+			options = append(options, fmt.Sprintf("%s=%s", opt[0], opt[1]))
+		}
+	}
+	return options, nil
 }
 
 func (p *linuxParser) ReadWrite(mode string) bool {
@@ -271,9 +334,11 @@ func (p *linuxParser) ParseMountRaw(raw, volumeDriver string) (*MountPoint, erro
 	}
 	return mp, err
 }
+
 func (p *linuxParser) ParseMountSpec(cfg mount.Mount) (*MountPoint, error) {
 	return p.parseMountSpec(cfg, true)
 }
+
 func (p *linuxParser) parseMountSpec(cfg mount.Mount, validateBindSourceExists bool) (*MountPoint, error) {
 	if err := p.validateMountConfigImpl(&cfg, validateBindSourceExists); err != nil {
 		return nil, err
@@ -287,9 +352,8 @@ func (p *linuxParser) parseMountSpec(cfg mount.Mount, validateBindSourceExists b
 
 	switch cfg.Type {
 	case mount.TypeVolume:
-		if cfg.Source == "" {
-			mp.Name = stringid.GenerateRandomID()
-		} else {
+		if cfg.Source != "" {
+			// non-anonymous volume
 			mp.Name = cfg.Source
 		}
 		mp.CopyData = p.DefaultCopyMode()
@@ -313,13 +377,24 @@ func (p *linuxParser) parseMountSpec(cfg mount.Mount, validateBindSourceExists b
 		}
 	case mount.TypeTmpfs:
 		// NOP
+	case mount.TypeImage:
+		mp.Source = cfg.Source
+		if cfg.BindOptions != nil && len(cfg.BindOptions.Propagation) > 0 {
+			mp.Propagation = cfg.BindOptions.Propagation
+		} else {
+			// If user did not specify a propagation mode, get
+			// default propagation mode.
+			mp.Propagation = linuxDefaultPropagationMode
+		}
+	default:
+		// TODO(thaJeztah): make switch exhaustive: anything to do for mount.TypeNamedPipe, mount.TypeCluster ?
 	}
 	return mp, nil
 }
 
 func (p *linuxParser) ParseVolumesFrom(spec string) (string, string, error) {
-	if len(spec) == 0 {
-		return "", "", fmt.Errorf("volumes-from specification cannot be an empty string")
+	if spec == "" {
+		return "", "", errors.New("volumes-from specification cannot be an empty string")
 	}
 
 	id, mode, _ := strings.Cut(spec, ":")
@@ -388,18 +463,28 @@ func (p *linuxParser) ConvertTmpfsOptions(opt *mount.TmpfsOptions, readOnly bool
 
 		rawOpts = append(rawOpts, fmt.Sprintf("size=%d%s", size, suffix))
 	}
+
+	if opt != nil && len(opt.Options) > 0 {
+		tmpfsOpts, err := validateTmpfsOptions(opt.Options)
+		if err != nil {
+			return "", err
+		}
+		rawOpts = append(rawOpts, tmpfsOpts...)
+	}
+
 	return strings.Join(rawOpts, ","), nil
 }
 
 func (p *linuxParser) DefaultCopyMode() bool {
 	return true
 }
+
 func (p *linuxParser) ValidateVolumeName(name string) error {
 	return nil
 }
 
 func (p *linuxParser) IsBackwardCompatible(m *MountPoint) bool {
-	return len(m.Source) > 0 || m.Driver == volume.DefaultDriverName
+	return m.Source != "" || m.Driver == volume.DefaultDriverName
 }
 
 func (p *linuxParser) ValidateTmpfsMountDestination(dest string) error {

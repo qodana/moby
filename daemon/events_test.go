@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"testing"
@@ -6,7 +6,7 @@ import (
 
 	containertypes "github.com/docker/docker/api/types/container"
 	eventtypes "github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/container"
 	"github.com/docker/docker/daemon/events"
 )
 
@@ -29,7 +29,7 @@ func TestLogContainerEventCopyLabels(t *testing.T) {
 	daemon := &Daemon{
 		EventsService: e,
 	}
-	daemon.LogContainerEvent(ctr, "create")
+	daemon.LogContainerEvent(ctr, eventtypes.ActionCreate)
 
 	if _, mutated := ctr.Config.Labels["image"]; mutated {
 		t.Fatalf("Expected to not mutate the container labels, got %q", ctr.Config.Labels)
@@ -59,11 +59,10 @@ func TestLogContainerEventWithAttributes(t *testing.T) {
 	daemon := &Daemon{
 		EventsService: e,
 	}
-	attributes := map[string]string{
+	daemon.LogContainerEventWithAttributes(ctr, eventtypes.ActionCreate, map[string]string{
 		"node": "2",
 		"foo":  "bar",
-	}
-	daemon.LogContainerEventWithAttributes(ctr, "create", attributes)
+	})
 
 	validateTestAttributes(t, l, map[string]string{
 		"node": "1",

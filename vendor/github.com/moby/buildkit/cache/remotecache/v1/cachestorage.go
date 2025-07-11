@@ -2,6 +2,7 @@ package cacheimport
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/moby/buildkit/identity"
@@ -194,10 +195,8 @@ func (cs *cacheKeyStorage) HasLink(id string, link solver.CacheInfoLink, target 
 		selector: link.Selector.String(),
 	}
 	if it, ok := cs.byID[id]; ok {
-		for _, id := range it.links[l] {
-			if id == target {
-				return true
-			}
+		if slices.Contains(it.links[l], target) {
+			return true
 		}
 	}
 	return false
@@ -291,7 +290,7 @@ func (cs *cacheResultStorage) LoadRemotes(ctx context.Context, res solver.CacheR
 	return nil, errors.WithStack(solver.ErrNotFound)
 }
 
-func (cs *cacheResultStorage) Exists(id string) bool {
+func (cs *cacheResultStorage) Exists(ctx context.Context, id string) bool {
 	return cs.byResultID(id) != nil
 }
 

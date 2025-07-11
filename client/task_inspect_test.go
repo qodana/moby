@@ -1,18 +1,20 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/errdefs"
-	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestTaskInspectError(t *testing.T) {
@@ -21,9 +23,7 @@ func TestTaskInspectError(t *testing.T) {
 	}
 
 	_, _, err := client.TaskInspectWithRaw(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestTaskInspectWithEmptyID(t *testing.T) {
@@ -33,9 +33,12 @@ func TestTaskInspectWithEmptyID(t *testing.T) {
 		}),
 	}
 	_, _, err := client.TaskInspectWithRaw(context.Background(), "")
-	if !IsErrNotFound(err) {
-		t.Fatalf("Expected NotFoundError, got %v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, _, err = client.TaskInspectWithRaw(context.Background(), "    ")
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestTaskInspect(t *testing.T) {
@@ -59,10 +62,6 @@ func TestTaskInspect(t *testing.T) {
 	}
 
 	taskInspect, _, err := client.TaskInspectWithRaw(context.Background(), "task_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if taskInspect.ID != "task_id" {
-		t.Fatalf("expected `task_id`, got %s", taskInspect.ID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(taskInspect.ID, "task_id"))
 }

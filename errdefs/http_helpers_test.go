@@ -1,15 +1,13 @@
 package errdefs
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"testing"
-
-	"gotest.tools/v3/assert"
 )
 
 func TestFromStatusCode(t *testing.T) {
-	testErr := fmt.Errorf("some error occurred")
+	testErr := errors.New("some error occurred")
 
 	testCases := []struct {
 		err    error
@@ -85,8 +83,11 @@ func TestFromStatusCode(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			//nolint:staticcheck // ignore SA1019: FromStatusCode is deprecated
 			err := FromStatusCode(tc.err, tc.status)
-			assert.Check(t, tc.check(err), "unexpected error-type %T", err)
+			if !tc.check(err) {
+				t.Errorf("unexpected error-type %T", err)
+			}
 		})
 	}
 }

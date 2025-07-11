@@ -1,13 +1,15 @@
-package distribution // import "github.com/docker/docker/distribution"
+package distribution
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
 	"syscall"
 
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	"github.com/docker/distribution"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/api/errcode"
 	v2 "github.com/docker/distribution/registry/api/v2"
 	"github.com/docker/distribution/registry/client"
@@ -15,7 +17,6 @@ import (
 	"github.com/docker/docker/distribution/xfer"
 	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // fallbackError wraps an error that can possibly allow fallback to a different
@@ -31,10 +32,14 @@ type fallbackError struct {
 
 // Error renders the FallbackError as a string.
 func (f fallbackError) Error() string {
-	return f.Cause().Error()
+	return f.err.Error()
 }
 
 func (f fallbackError) Cause() error {
+	return f.err
+}
+
+func (f fallbackError) Unwrap() error {
 	return f.err
 }
 
@@ -63,6 +68,10 @@ func (e notFoundError) Cause() error {
 	return e.cause
 }
 
+func (e notFoundError) Unwrap() error {
+	return e.cause
+}
+
 // unsupportedMediaTypeError is an error issued when attempted
 // to pull unsupported content.
 type unsupportedMediaTypeError struct {
@@ -81,11 +90,15 @@ func (e unsupportedMediaTypeError) Error() string {
 // information which is not used by the returned error gets output to
 // log at info level.
 func translatePullError(err error, ref reference.Named) error {
+	// FIXME(thaJeztah): cleanup error and context handling in this package, as it's really messy.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
 	switch v := err.(type) {
 	case errcode.Errors:
 		if len(v) != 0 {
 			for _, extra := range v[1:] {
-				logrus.WithError(extra).Infof("Ignoring extra error returned from registry")
+				log.G(context.TODO()).WithError(extra).Infof("Ignoring extra error returned from registry")
 			}
 			return translatePullError(v[0], ref)
 		}
@@ -101,26 +114,13 @@ func translatePullError(err error, ref reference.Named) error {
 	return errdefs.Unknown(err)
 }
 
-func isNotFound(err error) bool {
-	switch v := err.(type) {
-	case errcode.Errors:
-		for _, e := range v {
-			if isNotFound(e) {
-				return true
-			}
-		}
-	case errcode.Error:
-		switch v.Code {
-		case errcode.ErrorCodeDenied, v2.ErrorCodeManifestUnknown, v2.ErrorCodeNameUnknown:
-			return true
-		}
-	}
-	return false
-}
-
 // continueOnError returns true if we should fallback to the next endpoint
 // as a result of this error.
 func continueOnError(err error, mirrorEndpoint bool) bool {
+	// FIXME(thaJeztah): cleanup error and context handling in this package, as it's really messy.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	switch v := err.(type) {
 	case errcode.Errors:
 		if len(v) == 0 {
@@ -141,12 +141,13 @@ func continueOnError(err error, mirrorEndpoint bool) bool {
 		return false
 	case error:
 		return !strings.Contains(err.Error(), strings.ToLower(syscall.ESRCH.Error()))
+	default:
+		// let's be nice and fallback if the error is a completely
+		// unexpected one.
+		// If new errors have to be handled in some way, please
+		// add them to the switch above.
+		return true
 	}
-	// let's be nice and fallback if the error is a completely
-	// unexpected one.
-	// If new errors have to be handled in some way, please
-	// add them to the switch above.
-	return true
 }
 
 // retryOnError wraps the error in xfer.DoNotRetry if we should not retry the
@@ -163,15 +164,15 @@ func retryOnError(err error) error {
 			return xfer.DoNotRetry{Err: err}
 		}
 	case *url.Error:
-		switch v.Err {
-		case auth.ErrNoBasicAuthCredentials, auth.ErrNoToken:
+		switch {
+		case errors.Is(v.Err, auth.ErrNoBasicAuthCredentials), errors.Is(v.Err, auth.ErrNoToken):
 			return xfer.DoNotRetry{Err: v.Err}
 		}
 		return retryOnError(v.Err)
 	case *client.UnexpectedHTTPResponseError, unsupportedMediaTypeError:
 		return xfer.DoNotRetry{Err: err}
 	case error:
-		if err == distribution.ErrBlobUnknown {
+		if errors.Is(err, distribution.ErrBlobUnknown) {
 			return xfer.DoNotRetry{Err: err}
 		}
 		if strings.Contains(err.Error(), strings.ToLower(syscall.ENOSPC.Error())) {
@@ -184,6 +185,14 @@ func retryOnError(err error) error {
 	// add them to the switch above.
 	return err
 }
+
+type AIModelNotSupportedError struct{}
+
+func (e AIModelNotSupportedError) Error() string {
+	return `AI models are not yet supported by the Engine, please use "docker model pull/run" instead`
+}
+
+func (e AIModelNotSupportedError) InvalidParameter() {}
 
 type invalidManifestClassError struct {
 	mediaType string
@@ -211,3 +220,16 @@ func (e reservedNameError) Error() string {
 }
 
 func (e reservedNameError) Forbidden() {}
+
+type invalidArgumentErr struct{ error }
+
+func (invalidArgumentErr) InvalidParameter() {}
+
+func DeprecatedSchema1ImageError(ref reference.Named) error {
+	msg := "Docker Image Format v1 and Docker Image manifest version 2, schema 1 support has been removed."
+	if ref != nil {
+		msg += " Suggest the author of " + ref.String() + " to upgrade the image to the OCI Format or Docker Image manifest v2, schema 2."
+	}
+	msg += " More information at https://docs.docker.com/go/deprecated-image-specs/"
+	return invalidArgumentErr{errors.New(msg)}
+}

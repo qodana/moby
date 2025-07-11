@@ -1,4 +1,4 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
 	volumetypes "github.com/docker/docker/api/types/volume"
@@ -306,6 +306,9 @@ func volumeAvailabilityFromGRPC(availability swarmapi.VolumeSpec_VolumeAvailabil
 		return volumetypes.AvailabilityActive
 	case swarmapi.VolumeAvailabilityPause:
 		return volumetypes.AvailabilityPause
+	case swarmapi.VolumeAvailabilityDrain:
+		return volumetypes.AvailabilityDrain
+	default:
+		return volumetypes.AvailabilityDrain
 	}
-	return volumetypes.AvailabilityDrain
 }

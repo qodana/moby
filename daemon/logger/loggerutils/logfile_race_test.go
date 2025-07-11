@@ -1,7 +1,6 @@
 //go:build race
-// +build race
 
-package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
+package loggerutils
 
 import (
 	"context"
@@ -28,7 +27,7 @@ func TestConcurrentLogging(t *testing.T) {
 		maxFiles = 3
 		compress = true
 	)
-	getTailReader := func(ctx context.Context, r SizeReaderAt, lines int) (io.Reader, int, error) {
+	getTailReader := func(ctx context.Context, r SizeReaderAt, lines int) (SizeReaderAt, int, error) {
 		return tailfile.NewTailReader(ctx, r, lines)
 	}
 	createDecoder := func(io.Reader) Decoder {
@@ -44,14 +43,14 @@ func TestConcurrentLogging(t *testing.T) {
 	for ct := 0; ct < containers; ct++ {
 		ct := ct
 		dir := t.TempDir()
-		g.Go(func() (err error) {
-			logfile, err := NewLogFile(filepath.Join(dir, "log.log"), capacity, maxFiles, compress, createDecoder, 0644, getTailReader)
+		g.Go(func() (retErr error) {
+			logfile, err := NewLogFile(filepath.Join(dir, "log.log"), capacity, maxFiles, compress, createDecoder, 0o644, getTailReader)
 			if err != nil {
 				return err
 			}
 			defer func() {
-				if cErr := logfile.Close(); cErr != nil && err == nil {
-					err = cErr
+				if err := logfile.Close(); err != nil && retErr == nil {
+					retErr = err
 				}
 			}()
 			lg, ctx := errgroup.WithContext(ctx)

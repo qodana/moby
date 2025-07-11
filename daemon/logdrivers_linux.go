@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	// Importing packages here only to make sure their init gets called and
@@ -10,7 +10,6 @@ import (
 	_ "github.com/docker/docker/daemon/logger/journald"
 	_ "github.com/docker/docker/daemon/logger/jsonfilelog"
 	_ "github.com/docker/docker/daemon/logger/local"
-	_ "github.com/docker/docker/daemon/logger/logentries"
 	_ "github.com/docker/docker/daemon/logger/loggerutils/cache"
 	_ "github.com/docker/docker/daemon/logger/splunk"
 	_ "github.com/docker/docker/daemon/logger/syslog"

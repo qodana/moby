@@ -1,48 +1,48 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestEventsErrorInOptions(t *testing.T) {
 	errorCases := []struct {
-		options       types.EventsOptions
+		options       events.ListOptions
 		expectedError string
 	}{
 		{
-			options: types.EventsOptions{
+			options: events.ListOptions{
 				Since: "2006-01-02TZ",
 			},
 			expectedError: `parsing time "2006-01-02TZ"`,
 		},
 		{
-			options: types.EventsOptions{
+			options: events.ListOptions{
 				Until: "2006-01-02TZ",
 			},
 			expectedError: `parsing time "2006-01-02TZ"`,
 		},
 	}
-	for _, e := range errorCases {
+	for _, tc := range errorCases {
 		client := &Client{
 			client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 		}
-		_, errs := client.Events(context.Background(), e.options)
+		_, errs := client.Events(context.Background(), tc.options)
 		err := <-errs
-		if err == nil || !strings.Contains(err.Error(), e.expectedError) {
-			t.Fatalf("expected an error %q, got %v", e.expectedError, err)
-		}
+		assert.Check(t, is.ErrorContains(err, tc.expectedError))
 	}
 }
 
@@ -50,27 +50,25 @@ func TestEventsErrorFromServer(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	_, errs := client.Events(context.Background(), types.EventsOptions{})
+	_, errs := client.Events(context.Background(), events.ListOptions{})
 	err := <-errs
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestEvents(t *testing.T) {
 	const expectedURL = "/events"
 
-	fltrs := filters.NewArgs(filters.Arg("type", events.ContainerEventType))
-	expectedFiltersJSON := fmt.Sprintf(`{"type":{"%s":true}}`, events.ContainerEventType)
+	fltrs := filters.NewArgs(filters.Arg("type", string(events.ContainerEventType)))
+	expectedFiltersJSON := fmt.Sprintf(`{"type":{%q:true}}`, events.ContainerEventType)
 
 	eventsCases := []struct {
-		options             types.EventsOptions
+		options             events.ListOptions
 		events              []events.Message
 		expectedEvents      map[string]bool
 		expectedQueryParams map[string]string
 	}{
 		{
-			options: types.EventsOptions{
+			options: events.ListOptions{
 				Filters: fltrs,
 			},
 			expectedQueryParams: map[string]string{
@@ -80,7 +78,7 @@ func TestEvents(t *testing.T) {
 			expectedEvents: make(map[string]bool),
 		},
 		{
-			options: types.EventsOptions{
+			options: events.ListOptions{
 				Filters: fltrs,
 			},
 			expectedQueryParams: map[string]string{
@@ -89,18 +87,18 @@ func TestEvents(t *testing.T) {
 			events: []events.Message{
 				{
 					Type:   events.BuilderEventType,
-					ID:     "1",
-					Action: "create",
+					Actor:  events.Actor{ID: "1"},
+					Action: events.ActionCreate,
 				},
 				{
 					Type:   events.BuilderEventType,
-					ID:     "2",
-					Action: "die",
+					Actor:  events.Actor{ID: "1"},
+					Action: events.ActionDie,
 				},
 				{
 					Type:   events.BuilderEventType,
-					ID:     "3",
-					Action: "create",
+					Actor:  events.Actor{ID: "1"},
+					Action: events.ActionCreate,
 				},
 			},
 			expectedEvents: map[string]bool{
@@ -146,16 +144,14 @@ func TestEvents(t *testing.T) {
 		for {
 			select {
 			case err := <-errs:
-				if err != nil && err != io.EOF {
+				if err != nil && !errors.Is(err, io.EOF) {
 					t.Fatal(err)
 				}
 
 				break loop
 			case e := <-messages:
-				_, ok := eventsCase.expectedEvents[e.ID]
-				if !ok {
-					t.Fatalf("event received not expected with action %s & id %s", e.Action, e.ID)
-				}
+				_, ok := eventsCase.expectedEvents[e.Actor.ID]
+				assert.Check(t, ok, "event received not expected with action %s & id %s", e.Action, e.Actor.ID)
 			}
 		}
 	}

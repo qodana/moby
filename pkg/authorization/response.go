@@ -1,14 +1,15 @@
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net"
 	"net/http"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
 )
 
 // ResponseModifier allows authorization plugins to read and modify the content of the http.response
@@ -146,7 +147,7 @@ func (rm *responseModifier) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 	hijacker, ok := rm.rw.(http.Hijacker)
 	if !ok {
-		return nil, nil, fmt.Errorf("Internal response writer doesn't support the Hijacker interface")
+		return nil, nil, errors.New("Internal response writer doesn't support the Hijacker interface")
 	}
 	return hijacker.Hijack()
 }
@@ -155,7 +156,7 @@ func (rm *responseModifier) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (rm *responseModifier) Flush() {
 	flusher, ok := rm.rw.(http.Flusher)
 	if !ok {
-		logrus.Error("Internal response writer doesn't support the Flusher interface")
+		log.G(context.TODO()).Error("Internal response writer doesn't support the Flusher interface")
 		return
 	}
 

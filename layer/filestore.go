@@ -1,30 +1,28 @@
-package layer // import "github.com/docker/docker/layer"
+package layer
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/containerd/log"
 	"github.com/docker/distribution"
 	"github.com/docker/docker/pkg/ioutils"
+	"github.com/moby/sys/atomicwriter"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
-var (
-	stringIDRegexp      = regexp.MustCompile(`^[a-f0-9]{64}(-init)?$`)
-	supportedAlgorithms = []digest.Algorithm{
-		digest.SHA256,
-		// digest.SHA384, // Currently not used
-		// digest.SHA512, // Currently not used
-	}
-)
+var supportedAlgorithms = []digest.Algorithm{
+	digest.SHA256,
+	// digest.SHA384, // Currently not used
+	// digest.SHA512, // Currently not used
+}
 
 type fileMetadataStore struct {
 	root string
@@ -32,7 +30,7 @@ type fileMetadataStore struct {
 
 type fileMetadataTransaction struct {
 	store *fileMetadataStore
-	ws    *ioutils.AtomicWriteSet
+	ws    *atomicwriter.WriteSet
 }
 
 // newFSMetadataStore returns an instance of a metadata store
@@ -48,8 +46,7 @@ func newFSMetadataStore(root string) (*fileMetadataStore, error) {
 }
 
 func (fms *fileMetadataStore) getLayerDirectory(layer ChainID) string {
-	dgst := digest.Digest(layer)
-	return filepath.Join(fms.root, string(dgst.Algorithm()), dgst.Encoded())
+	return filepath.Join(fms.root, string(layer.Algorithm()), layer.Encoded())
 }
 
 func (fms *fileMetadataStore) getLayerFilename(layer ChainID, filename string) string {
@@ -69,7 +66,7 @@ func (fms *fileMetadataStore) StartTransaction() (*fileMetadataTransaction, erro
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return nil, err
 	}
-	ws, err := ioutils.NewAtomicWriteSet(tmpDir)
+	ws, err := atomicwriter.NewWriteSet(tmpDir)
 	if err != nil {
 		return nil, err
 	}
@@ -85,11 +82,11 @@ func (fm *fileMetadataTransaction) SetSize(size int64) error {
 }
 
 func (fm *fileMetadataTransaction) SetParent(parent ChainID) error {
-	return fm.ws.WriteFile("parent", []byte(digest.Digest(parent).String()), 0o644)
+	return fm.ws.WriteFile("parent", []byte(parent.String()), 0o644)
 }
 
 func (fm *fileMetadataTransaction) SetDiffID(diff DiffID) error {
-	return fm.ws.WriteFile("diff", []byte(digest.Digest(diff).String()), 0o644)
+	return fm.ws.WriteFile("diff", []byte(diff.String()), 0o644)
 }
 
 func (fm *fileMetadataTransaction) SetCacheID(cacheID string) error {
@@ -167,7 +164,7 @@ func (fms *fileMetadataStore) GetParent(layer ChainID) (ChainID, error) {
 		return "", err
 	}
 
-	return ChainID(dgst), nil
+	return dgst, nil
 }
 
 func (fms *fileMetadataStore) GetDiffID(layer ChainID) (DiffID, error) {
@@ -181,7 +178,7 @@ func (fms *fileMetadataStore) GetDiffID(layer ChainID) (DiffID, error) {
 		return "", err
 	}
 
-	return DiffID(dgst), nil
+	return dgst, nil
 }
 
 func (fms *fileMetadataStore) GetCacheID(layer ChainID) (string, error) {
@@ -251,7 +248,7 @@ func (fms *fileMetadataStore) SetMountParent(mount string, parent ChainID) error
 	if err := os.MkdirAll(fms.getMountDirectory(mount), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(fms.getMountFilename(mount, "parent"), []byte(digest.Digest(parent).String()), 0o644)
+	return os.WriteFile(fms.getMountFilename(mount, "parent"), []byte(parent.String()), 0o644)
 }
 
 func (fms *fileMetadataStore) GetMountID(mount string) (string, error) {
@@ -261,7 +258,7 @@ func (fms *fileMetadataStore) GetMountID(mount string) (string, error) {
 	}
 	content := strings.TrimSpace(string(contentBytes))
 
-	if !stringIDRegexp.MatchString(content) {
+	if !isValidID(content) {
 		return "", errors.New("invalid mount id value")
 	}
 
@@ -278,7 +275,7 @@ func (fms *fileMetadataStore) GetInitID(mount string) (string, error) {
 	}
 	content := strings.TrimSpace(string(contentBytes))
 
-	if !stringIDRegexp.MatchString(content) {
+	if !isValidID(content) {
 		return "", errors.New("invalid init id value")
 	}
 
@@ -299,7 +296,7 @@ func (fms *fileMetadataStore) GetMountParent(mount string) (ChainID, error) {
 		return "", err
 	}
 
-	return ChainID(dgst), nil
+	return dgst, nil
 }
 
 func (fms *fileMetadataStore) getOrphan() ([]roLayer, error) {
@@ -322,7 +319,7 @@ func (fms *fileMetadataStore) getOrphan() ([]roLayer, error) {
 			nameSplit := strings.Split(fi.Name(), "-")
 			dgst := digest.NewDigestFromEncoded(algorithm, nameSplit[0])
 			if err := dgst.Validate(); err != nil {
-				logrus.WithError(err).WithField("digest", string(algorithm)+":"+nameSplit[0]).Debug("ignoring invalid digest")
+				log.G(context.TODO()).WithError(err).WithField("digest", string(algorithm)+":"+nameSplit[0]).Debug("ignoring invalid digest")
 				continue
 			}
 
@@ -330,18 +327,18 @@ func (fms *fileMetadataStore) getOrphan() ([]roLayer, error) {
 			contentBytes, err := os.ReadFile(chainFile)
 			if err != nil {
 				if !os.IsNotExist(err) {
-					logrus.WithError(err).WithField("digest", dgst).Error("failed to read cache ID")
+					log.G(context.TODO()).WithError(err).WithField("digest", dgst).Error("failed to read cache ID")
 				}
 				continue
 			}
 			cacheID := strings.TrimSpace(string(contentBytes))
 			if cacheID == "" {
-				logrus.Error("invalid cache ID")
+				log.G(context.TODO()).Error("invalid cache ID")
 				continue
 			}
 
 			l := &roLayer{
-				chainID: ChainID(dgst),
+				chainID: dgst,
 				cacheID: cacheID,
 			}
 			orphanLayers = append(orphanLayers, *l)
@@ -366,9 +363,9 @@ func (fms *fileMetadataStore) List() ([]ChainID, []string, error) {
 			if fi.IsDir() && fi.Name() != "mounts" {
 				dgst := digest.NewDigestFromEncoded(algorithm, fi.Name())
 				if err := dgst.Validate(); err != nil {
-					logrus.Debugf("Ignoring invalid digest %s:%s", algorithm, fi.Name())
+					log.G(context.TODO()).Debugf("Ignoring invalid digest %s:%s", algorithm, fi.Name())
 				} else {
-					ids = append(ids, ChainID(dgst))
+					ids = append(ids, dgst)
 				}
 			}
 		}
@@ -394,7 +391,7 @@ func (fms *fileMetadataStore) List() ([]ChainID, []string, error) {
 
 // Remove layerdb folder if that is marked for removal
 func (fms *fileMetadataStore) Remove(layer ChainID, cache string) error {
-	dgst := digest.Digest(layer)
+	dgst := layer
 	files, err := os.ReadDir(filepath.Join(fms.root, string(dgst.Algorithm())))
 	if err != nil {
 		return err
@@ -410,17 +407,17 @@ func (fms *fileMetadataStore) Remove(layer ChainID, cache string) error {
 		chainFile := filepath.Join(dir, "cache-id")
 		contentBytes, err := os.ReadFile(chainFile)
 		if err != nil {
-			logrus.WithError(err).WithField("file", chainFile).Error("cannot get cache ID")
+			log.G(context.TODO()).WithError(err).WithField("file", chainFile).Error("cannot get cache ID")
 			continue
 		}
 		cacheID := strings.TrimSpace(string(contentBytes))
 		if cacheID != cache {
 			continue
 		}
-		logrus.Debugf("Removing folder: %s", dir)
+		log.G(context.TODO()).Debugf("Removing folder: %s", dir)
 		err = os.RemoveAll(dir)
 		if err != nil && !os.IsNotExist(err) {
-			logrus.WithError(err).WithField("name", f.Name()).Error("cannot remove layer")
+			log.G(context.TODO()).WithError(err).WithField("name", f.Name()).Error("cannot remove layer")
 			continue
 		}
 	}
@@ -429,4 +426,19 @@ func (fms *fileMetadataStore) Remove(layer ChainID, cache string) error {
 
 func (fms *fileMetadataStore) RemoveMount(mount string) error {
 	return os.RemoveAll(fms.getMountDirectory(mount))
+}
+
+// isValidID checks if mount/init id is valid. It is similar to
+// regexp.MustCompile(`^[a-f0-9]{64}(-init)?$`).MatchString(id).
+func isValidID(id string) bool {
+	id = strings.TrimSuffix(id, "-init")
+	if len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

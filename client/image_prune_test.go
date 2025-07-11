@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/image"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -25,9 +25,7 @@ func TestImagesPruneError(t *testing.T) {
 	}
 
 	_, err := client.ImagesPrune(context.Background(), filters.NewArgs())
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImagesPrune(t *testing.T) {
@@ -85,8 +83,8 @@ func TestImagesPrune(t *testing.T) {
 					actual := query.Get(key)
 					assert.Check(t, is.Equal(expected, actual))
 				}
-				content, err := json.Marshal(types.ImagesPruneReport{
-					ImagesDeleted: []types.ImageDeleteResponseItem{
+				content, err := json.Marshal(image.PruneReport{
+					ImagesDeleted: []image.DeleteResponse{
 						{
 							Deleted: "image_id1",
 						},
@@ -108,7 +106,7 @@ func TestImagesPrune(t *testing.T) {
 		}
 
 		report, err := client.ImagesPrune(context.Background(), listCase.filters)
-		assert.Check(t, err)
+		assert.NilError(t, err)
 		assert.Check(t, is.Len(report.ImagesDeleted, 2))
 		assert.Check(t, is.Equal(uint64(9999), report.SpaceReclaimed))
 	}

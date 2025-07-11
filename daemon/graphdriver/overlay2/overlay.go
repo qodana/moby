@@ -1,7 +1,6 @@
 //go:build linux
-// +build linux
 
-package overlay2 // import "github.com/docker/docker/daemon/graphdriver/overlay2"
+package overlay2
 
 import (
 	"context"
@@ -16,27 +15,28 @@ import (
 	"sync"
 
 	"github.com/containerd/continuity/fs"
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/daemon/graphdriver/overlayutils"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/chrootarchive"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/directory"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/docker/daemon/internal/fstype"
+	"github.com/docker/docker/daemon/internal/mountref"
+	"github.com/docker/docker/internal/containerfs"
+	"github.com/docker/docker/internal/directory"
 	"github.com/docker/docker/quota"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/go-archive"
+	"github.com/moby/go-archive/chrootarchive"
 	"github.com/moby/locker"
+	"github.com/moby/sys/atomicwriter"
 	"github.com/moby/sys/mount"
+	"github.com/moby/sys/user"
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
-var (
-	// untar defines the untar method
-	untar = chrootarchive.UntarUncompressed
-)
+// untar defines the untar method
+var untar = chrootarchive.UntarUncompressed
 
 // This backend uses the overlay union filesystem for containers
 // with diff directories for each layer.
@@ -92,8 +92,8 @@ type overlayOptions struct {
 // mounts that are created using this driver.
 type Driver struct {
 	home          string
-	idMap         idtools.IdentityMapping
-	ctr           *graphdriver.RefCounter
+	idMap         user.IdentityMapping
+	ctr           *mountref.Counter
 	quotaCtl      *quota.Control
 	options       overlayOptions
 	naiveDiff     graphdriver.DiffDriver
@@ -103,7 +103,7 @@ type Driver struct {
 }
 
 var (
-	logger                = logrus.WithField("storage-driver", "overlay2")
+	logger                = log.G(context.TODO()).WithField("storage-driver", "overlay2")
 	backingFs             = "<unknown>"
 	projectQuotaSupported = false
 
@@ -123,7 +123,7 @@ func init() {
 // graphdriver.ErrNotSupported is returned.
 // If an overlay filesystem is not supported over an existing filesystem then
 // the error graphdriver.ErrIncompatibleFS is returned.
-func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdriver.Driver, error) {
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	opts, err := parseOptions(options)
 	if err != nil {
 		return nil, err
@@ -143,11 +143,11 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, graphdriver.ErrNotSupported
 	}
 
-	fsMagic, err := graphdriver.GetFSMagic(testdir)
+	fsMagic, err := fstype.GetFSMagic(testdir)
 	if err != nil {
 		return nil, err
 	}
-	if fsName, ok := graphdriver.FsNames[fsMagic]; ok {
+	if fsName, ok := fstype.FsNames[fsMagic]; ok {
 		backingFs = fsName
 	}
 
@@ -164,22 +164,19 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		return nil, err
 	}
 
-	cur := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: cur.UID,
-		GID: idMap.RootPair().GID,
-	}
-	if err := idtools.MkdirAllAndChown(home, 0710, dirID); err != nil {
+	cuid := os.Getuid()
+	_, gid := idMap.RootPair()
+	if err := user.MkdirAllAndChown(home, 0o710, cuid, gid); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAllAndChown(path.Join(home, linkDir), 0700, cur); err != nil {
+	if err := user.MkdirAllAndChown(path.Join(home, linkDir), 0o700, cuid, os.Getegid()); err != nil {
 		return nil, err
 	}
 
 	d := &Driver{
 		home:          home,
 		idMap:         idMap,
-		ctr:           graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicOverlay)),
+		ctr:           mountref.NewCounter(isMounted),
 		supportsDType: supportsDType,
 		usingMetacopy: usingMetacopy,
 		locker:        locker.New(),
@@ -225,10 +222,16 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 	return d, nil
 }
 
+// isMounted checks whether the given path is a [fstype.FsMagicOverlay] mount.
+func isMounted(path string) bool {
+	fsType, _ := fstype.GetFSMagic(path)
+	return fsType == fstype.FsMagicOverlay
+}
+
 func parseOptions(options []string) (*overlayOptions, error) {
 	o := &overlayOptions{}
 	for _, option := range options {
-		key, val, err := parsers.ParseKeyValueOpt(option)
+		key, val, err := graphdriver.ParseStorageOptKeyValue(option)
 		if err != nil {
 			return nil, err
 		}
@@ -322,7 +325,7 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 	}
 
 	if _, ok := opts.StorageOpt["size"]; ok && !projectQuotaSupported {
-		return fmt.Errorf("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
+		return errors.New("--storage-opt is supported only for overlay over xfs with 'pquota' mount option")
 	}
 
 	return d.create(id, parent, opts)
@@ -333,7 +336,7 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	if opts != nil && len(opts.StorageOpt) != 0 {
 		if _, ok := opts.StorageOpt["size"]; ok {
-			return fmt.Errorf("--storage-opt size is only supported for ReadWrite Layers")
+			return errors.New("--storage-opt size is only supported for ReadWrite Layers")
 		}
 	}
 	return d.create(id, parent, opts)
@@ -342,16 +345,12 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
 
-	root := d.idMap.RootPair()
-	dirID := idtools.Identity{
-		UID: idtools.CurrentIdentity().UID,
-		GID: root.GID,
-	}
-
-	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0710, dirID); err != nil {
+	cuid := os.Getuid()
+	uid, gid := d.idMap.RootPair()
+	if err := user.MkdirAllAndChown(path.Dir(dir), 0o710, cuid, gid); err != nil {
 		return err
 	}
-	if err := idtools.MkdirAndChown(dir, 0710, dirID); err != nil {
+	if err := user.MkdirAndChown(dir, 0o710, cuid, gid); err != nil {
 		return err
 	}
 
@@ -376,7 +375,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		}
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0755, root); err != nil {
+	if err := user.MkdirAndChown(path.Join(dir, diffDirName), 0o755, uid, gid); err != nil {
 		return err
 	}
 
@@ -386,7 +385,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	}
 
 	// Write link id to link file
-	if err := os.WriteFile(path.Join(dir, "link"), []byte(lid), 0644); err != nil {
+	if err := atomicwriter.WriteFile(path.Join(dir, "link"), []byte(lid), 0o644); err != nil {
 		return err
 	}
 
@@ -395,11 +394,11 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0700, root); err != nil {
+	if err := user.MkdirAndChown(path.Join(dir, workDirName), 0o700, uid, gid); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(path.Join(d.dir(parent), "committed"), []byte{}, 0600); err != nil {
+	if err := atomicwriter.WriteFile(path.Join(d.dir(parent), "committed"), []byte{}, 0o600); err != nil {
 		return err
 	}
 
@@ -408,7 +407,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return err
 	}
 	if lower != "" {
-		if err := os.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0666); err != nil {
+		if err := atomicwriter.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0o644); err != nil {
 			return err
 		}
 	}
@@ -420,7 +419,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) error {
 	// Read size to set the disk project quota per container
 	for key, val := range storageOpt {
-		key := strings.ToLower(key)
+		key = strings.ToLower(key)
 		switch key {
 		case "size":
 			size, err := units.RAMInBytes(val)
@@ -486,7 +485,7 @@ func (d *Driver) getLowerDirs(id string) ([]string, error) {
 // Remove cleans the directories that are created for this id.
 func (d *Driver) Remove(id string) error {
 	if id == "" {
-		return fmt.Errorf("refusing to remove the directories: id is empty")
+		return errors.New("refusing to remove the directories: id is empty")
 	}
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
@@ -567,8 +566,8 @@ func (d *Driver) Get(id, mountLabel string) (_ string, retErr error) {
 	mount := unix.Mount
 	mountTarget := mergedDir
 
-	root := d.idMap.RootPair()
-	if err := idtools.MkdirAndChown(mergedDir, 0700, root); err != nil {
+	uid, gid := d.idMap.RootPair()
+	if err := user.MkdirAndChown(mergedDir, 0o700, uid, gid); err != nil {
 		return "", err
 	}
 
@@ -602,7 +601,7 @@ func (d *Driver) Get(id, mountLabel string) (_ string, retErr error) {
 	if !readonly {
 		// chown "workdir/work" to the remapped root UID/GID. Overlay fs inside a
 		// user namespace requires this to move a directory from lower to upper.
-		if err := root.Chown(path.Join(workDir, workDirName)); err != nil {
+		if err := os.Chown(path.Join(workDir, workDirName), uid, gid); err != nil {
 			return "", err
 		}
 	}
@@ -675,12 +674,11 @@ func (d *Driver) isParent(id, parent string) bool {
 }
 
 // ApplyDiff applies the new layer into a root
-func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, err error) {
+func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64, _ error) {
 	if useNaiveDiff(d.home) || !d.isParent(id, parent) {
 		return d.naiveDiff.ApplyDiff(id, parent, diff)
 	}
 
-	// never reach here if we are running in UserNS
 	applyDir := d.getDiffPath(id)
 
 	logger.Debugf("Applying tar in %s", applyDir)
@@ -688,6 +686,7 @@ func (d *Driver) ApplyDiff(id string, parent string, diff io.Reader) (size int64
 	if err := untar(diff, applyDir, &archive.TarOptions{
 		IDMap:          d.idMap,
 		WhiteoutFormat: archive.OverlayWhiteoutFormat,
+		InUserNS:       userns.RunningInUserNS(),
 	}); err != nil {
 		return 0, err
 	}
@@ -704,7 +703,7 @@ func (d *Driver) getDiffPath(id string) string {
 // DiffSize calculates the changes between the specified id
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
-func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
+func (d *Driver) DiffSize(id, parent string) (int64, error) {
 	if useNaiveDiff(d.home) || !d.isParent(id, parent) {
 		return d.naiveDiff.DiffSize(id, parent)
 	}

@@ -1,23 +1,24 @@
 //go:build linux
-// +build linux
 
 package ipvlan
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
+	"github.com/containerd/log"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/ns"
 	"github.com/docker/docker/libnetwork/options"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/parsers/kernel"
-	"github.com/docker/docker/pkg/stringid"
-	"github.com/sirupsen/logrus"
 )
 
 // CreateNetwork the network for the specified driver type
-func (d *driver) CreateNetwork(nid string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
+func (d *driver) CreateNetwork(ctx context.Context, nid string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	kv, err := kernel.GetKernelVersion()
 	if err != nil {
 		return fmt.Errorf("failed to check kernel version for ipvlan driver support: %v", err)
@@ -27,9 +28,17 @@ func (d *driver) CreateNetwork(nid string, option map[string]interface{}, nInfo 
 		return fmt.Errorf("kernel version failed to meet the minimum ipvlan kernel requirement of %d.%d, found %d.%d.%d",
 			ipvlanKernelVer, ipvlanMajorVer, kv.Kernel, kv.Major, kv.Minor)
 	}
-	// reject a null v4 network
-	if len(ipV4Data) == 0 || ipV4Data[0].Pool.String() == "0.0.0.0/0" {
-		return fmt.Errorf("ipv4 pool is empty")
+	// reject a null v4 network if ipv4 is required
+	if v, ok := option[netlabel.EnableIPv4]; ok && v.(bool) {
+		if len(ipV4Data) == 0 || ipV4Data[0].Pool.String() == "0.0.0.0/0" {
+			return errdefs.InvalidParameter(errors.New("ipv4 pool is empty"))
+		}
+	}
+	// reject a null v6 network if ipv6 is required
+	if v, ok := option[netlabel.EnableIPv6]; ok && v.(bool) {
+		if len(ipV6Data) == 0 || ipV6Data[0].Pool.String() == "::/0" {
+			return errdefs.InvalidParameter(errors.New("ipv6 pool is empty"))
+		}
 	}
 	// parse and validate the config and bind to networkConfiguration
 	config, err := parseNetworkOptions(nid, option)
@@ -40,7 +49,7 @@ func (d *driver) CreateNetwork(nid string, option map[string]interface{}, nInfo 
 
 	// if parent interface not specified, create a dummy type link to use named dummy+net_id
 	if config.Parent == "" {
-		config.Parent = getDummyName(stringid.TruncateID(config.ID))
+		config.Parent = getDummyName(config.ID)
 	}
 	foundExisting, err := d.createNetwork(config)
 	if err != nil {
@@ -55,7 +64,7 @@ func (d *driver) CreateNetwork(nid string, option map[string]interface{}, nInfo 
 	err = d.storeUpdate(config)
 	if err != nil {
 		d.deleteNetwork(config.ID)
-		logrus.Debugf("encountered an error rolling back a network create for %s : %v", config.ID, err)
+		log.G(context.TODO()).Debugf("encountered an error rolling back a network create for %s : %v", config.ID, err)
 		return err
 	}
 
@@ -70,16 +79,16 @@ func (d *driver) createNetwork(config *configuration) (bool, error) {
 		if config.Parent == nw.config.Parent {
 			if config.ID != nw.config.ID {
 				return false, fmt.Errorf("network %s is already using parent interface %s",
-					getDummyName(stringid.TruncateID(nw.config.ID)), config.Parent)
+					getDummyName(nw.config.ID), config.Parent)
 			}
-			logrus.Debugf("Create Network for the same ID %s\n", config.ID)
+			log.G(context.TODO()).Debugf("Create Network for the same ID %s\n", config.ID)
 			foundExisting = true
 			break
 		}
 	}
 	if !parentExists(config.Parent) {
 		// Create a dummy link if a dummy name is set for parent
-		if dummyName := getDummyName(stringid.TruncateID(config.ID)); dummyName == config.Parent {
+		if dummyName := getDummyName(config.ID); dummyName == config.Parent {
 			err := createDummyLink(config.Parent, dummyName)
 			if err != nil {
 				return false, err
@@ -87,7 +96,7 @@ func (d *driver) createNetwork(config *configuration) (bool, error) {
 			config.CreatedSlaveLink = true
 
 			// notify the user in logs that they have limited communications
-			logrus.Debugf("Empty -o parent= flags limit communications to other containers inside of network: %s",
+			log.G(context.TODO()).Debugf("Empty -o parent= flags limit communications to other containers inside of network: %s",
 				config.Parent)
 		} else {
 			// if the subinterface parent_iface.vlan_id checks do not pass, return err.
@@ -114,6 +123,20 @@ func (d *driver) createNetwork(config *configuration) (bool, error) {
 	return foundExisting, nil
 }
 
+func (d *driver) GetSkipGwAlloc(opts options.Generic) (ipv4, ipv6 bool, _ error) {
+	cfg, err := parseNetworkOptions("dummy", opts)
+	if err != nil {
+		return false, false, err
+	}
+	// L3 ipvlans connect the default route to an interface, no gateway address is set up.
+	switch cfg.IpvlanMode {
+	case modeL3, modeL3S:
+		return true, true, nil
+	}
+	// "--internal" networks don't need a gateway address.
+	return cfg.Internal, cfg.Internal, nil
+}
+
 // DeleteNetwork deletes the network for the specified driver type
 func (d *driver) DeleteNetwork(nid string) error {
 	n := d.network(nid)
@@ -125,17 +148,17 @@ func (d *driver) DeleteNetwork(nid string) error {
 		// if the interface exists, only delete if it matches iface.vlan or dummy.net_id naming
 		if ok := parentExists(n.config.Parent); ok {
 			// only delete the link if it is named the net_id
-			if n.config.Parent == getDummyName(stringid.TruncateID(nid)) {
+			if n.config.Parent == getDummyName(nid) {
 				err := delDummyLink(n.config.Parent)
 				if err != nil {
-					logrus.Debugf("link %s was not deleted, continuing the delete network operation: %v",
+					log.G(context.TODO()).Debugf("link %s was not deleted, continuing the delete network operation: %v",
 						n.config.Parent, err)
 				}
 			} else {
 				// only delete the link if it matches iface.vlan naming
 				err := delVlanLink(n.config.Parent)
 				if err != nil {
-					logrus.Debugf("link %s was not deleted, continuing the delete network operation: %v",
+					log.G(context.TODO()).Debugf("link %s was not deleted, continuing the delete network operation: %v",
 						n.config.Parent, err)
 				}
 			}
@@ -144,12 +167,12 @@ func (d *driver) DeleteNetwork(nid string) error {
 	for _, ep := range n.endpoints {
 		if link, err := ns.NlHandle().LinkByName(ep.srcName); err == nil {
 			if err := ns.NlHandle().LinkDel(link); err != nil {
-				logrus.WithError(err).Warnf("Failed to delete interface (%s)'s link on endpoint (%s) delete", ep.srcName, ep.id)
+				log.G(context.TODO()).WithError(err).Warnf("Failed to delete interface (%s)'s link on endpoint (%s) delete", ep.srcName, ep.id)
 			}
 		}
 
 		if err := d.storeDelete(ep); err != nil {
-			logrus.Warnf("Failed to remove ipvlan endpoint %.7s from store: %v", ep.id, err)
+			log.G(context.TODO()).Warnf("Failed to remove ipvlan endpoint %.7s from store: %v", ep.id, err)
 		}
 	}
 	// delete the *network
@@ -157,7 +180,7 @@ func (d *driver) DeleteNetwork(nid string) error {
 	// delete the network record from persistent cache
 	err := d.storeDelete(n.config)
 	if err != nil {
-		return fmt.Errorf("error deleting deleting id %s from datastore: %v", nid, err)
+		return fmt.Errorf("error deleting id %s from datastore: %v", nid, err)
 	}
 	return nil
 }
@@ -204,7 +227,12 @@ func parseNetworkOptions(id string, option options.Generic) (*configuration, err
 
 	// loopback is not a valid parent link
 	if config.Parent == "lo" {
-		return nil, fmt.Errorf("loopback interface is not a valid ipvlan parent link")
+		return nil, errors.New("loopback interface is not a valid ipvlan parent link")
+	}
+
+	// With no parent interface, the network is "internal".
+	if config.Parent == "" {
+		config.Internal = true
 	}
 
 	config.ID = id
@@ -218,15 +246,8 @@ func parseNetworkGenericOptions(data interface{}) (*configuration, error) {
 		return opt, nil
 	case map[string]string:
 		return newConfigFromLabels(opt), nil
-	case options.Generic:
-		var config *configuration
-		opaqueConfig, err := options.GenerateFromModel(opt, config)
-		if err != nil {
-			return nil, err
-		}
-		return opaqueConfig.(*configuration), nil
 	default:
-		return nil, types.BadRequestErrorf("unrecognized network configuration format: %v", opt)
+		return nil, types.InvalidParameterErrorf("unrecognized network configuration format: %v", opt)
 	}
 }
 

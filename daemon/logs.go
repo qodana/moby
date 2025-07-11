@@ -1,20 +1,21 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"strconv"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
 	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/config"
+	"github.com/docker/docker/daemon/container"
 	"github.com/docker/docker/daemon/logger"
 	logcache "github.com/docker/docker/daemon/logger/loggerutils/cache"
 	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ContainerLogs copies the container's log channel to the channel provided in
@@ -23,14 +24,20 @@ import (
 //
 // if it returns nil, the config channel will be active and return log
 // messages until it runs out or the context is canceled.
-func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, config *types.ContainerLogsOptions) (messages <-chan *backend.LogMessage, isTTY bool, retErr error) {
-	lg := logrus.WithFields(logrus.Fields{
+func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, config *containertypes.LogsOptions) (messages <-chan *backend.LogMessage, isTTY bool, retErr error) {
+	ctx, span := tracing.StartSpan(ctx, "daemon.ContainerLogs")
+	defer func() {
+		span.SetStatus(retErr)
+		span.End()
+	}()
+
+	lg := log.G(ctx).WithFields(log.Fields{
 		"module":    "daemon",
 		"method":    "(*Daemon).ContainerLogs",
 		"container": containerName,
 	})
 
-	if !(config.ShowStdout || config.ShowStderr) {
+	if !config.ShowStdout && !config.ShowStderr {
 		return nil, false, errdefs.InvalidParameter(errors.New("You must choose at least one stream"))
 	}
 	ctr, err := daemon.GetContainer(containerName)
@@ -54,7 +61,7 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 		defer func() {
 			if retErr != nil {
 				if err = cLog.Close(); err != nil {
-					logrus.Errorf("Error closing logger: %v", err)
+					log.G(ctx).Errorf("Error closing logger: %v", err)
 				}
 			}
 		}()
@@ -65,7 +72,6 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 		return nil, false, logger.ErrReadLogsNotSupported{}
 	}
 
-	follow := config.Follow && !cLogCreated
 	tailLines, err := strconv.Atoi(config.Tail)
 	if err != nil {
 		tailLines = -1
@@ -89,14 +95,13 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 		until = time.Unix(s, n)
 	}
 
-	readConfig := logger.ReadConfig{
+	follow := config.Follow && !cLogCreated
+	logs := logReader.ReadLogs(ctx, logger.ReadConfig{
 		Since:  since,
 		Until:  until,
 		Tail:   tailLines,
 		Follow: follow,
-	}
-
-	logs := logReader.ReadLogs(readConfig)
+	})
 
 	// past this point, we can't possibly return any errors, so we can just
 	// start a goroutine and return to tell the caller not to expect errors
@@ -107,7 +112,7 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 		if cLogCreated {
 			defer func() {
 				if err = cLog.Close(); err != nil {
-					logrus.Errorf("Error closing logger: %v", err)
+					log.G(ctx).Errorf("Error closing logger: %v", err)
 				}
 			}()
 		}
@@ -160,17 +165,25 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 	return messageChan, ctr.Config.Tty, nil
 }
 
-func (daemon *Daemon) getLogger(container *container.Container) (l logger.Logger, created bool, err error) {
+func (daemon *Daemon) getLogger(container *container.Container) (_ logger.Logger, created bool, _ error) {
+	var logDriver logger.Logger
 	container.Lock()
 	if container.State.Running {
-		l = container.LogDriver
+		logDriver = container.LogDriver
 	}
 	container.Unlock()
-	if l == nil {
-		created = true
-		l, err = container.StartLogger()
+	if logDriver != nil {
+		return logDriver, false, nil
 	}
-	return
+	logDriver, err := container.StartLogger()
+	if err != nil {
+		// Let's assume a driver was created, but failed to start;
+		// see https://github.com/moby/moby/pull/49493#discussion_r1979120968
+		//
+		// TODO(thaJeztah): check if we're not leaking resources if a logger was created, but failed to start.
+		return nil, true, err
+	}
+	return logDriver, true, nil
 }
 
 // mergeAndVerifyLogConfig merges the daemon log config to the container's log config if the container's log driver is not specified.
@@ -196,18 +209,14 @@ func (daemon *Daemon) mergeAndVerifyLogConfig(cfg *containertypes.LogConfig) err
 	return logger.ValidateLogOpts(cfg.Type, cfg.Config)
 }
 
-func (daemon *Daemon) setupDefaultLogConfig() error {
-	config := daemon.configStore
-	if len(config.LogConfig.Config) > 0 {
-		if err := logger.ValidateLogOpts(config.LogConfig.Type, config.LogConfig.Config); err != nil {
-			return errors.Wrap(err, "failed to set log opts")
+func defaultLogConfig(cfg *config.Config) (containertypes.LogConfig, error) {
+	if len(cfg.LogConfig.Config) > 0 {
+		if err := logger.ValidateLogOpts(cfg.LogConfig.Type, cfg.LogConfig.Config); err != nil {
+			return containertypes.LogConfig{}, errors.Wrap(err, "failed to set log opts")
 		}
 	}
-	daemon.defaultLogConfig = containertypes.LogConfig{
-		Type:   config.LogConfig.Type,
-		Config: config.LogConfig.Config,
-	}
-
-	logrus.Debugf("Using default logging driver %s", daemon.defaultLogConfig.Type)
-	return nil
+	return containertypes.LogConfig{
+		Type:   cfg.LogConfig.Type,
+		Config: cfg.LogConfig.Config,
+	}, nil
 }

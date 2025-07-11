@@ -1,4 +1,4 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
 	"context"
@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	executorpkg "github.com/docker/docker/daemon/cluster/executor"
 	"github.com/docker/docker/libnetwork"
@@ -65,7 +66,7 @@ func (r *controller) Task() (*api.Task, error) {
 func (r *controller) ContainerStatus(ctx context.Context) (*api.ContainerStatus, error) {
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if isUnknownContainer(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -76,7 +77,7 @@ func (r *controller) ContainerStatus(ctx context.Context) (*api.ContainerStatus,
 func (r *controller) PortStatus(ctx context.Context) (*api.PortStatus, error) {
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if isUnknownContainer(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, nil
 		}
 
@@ -178,7 +179,7 @@ func (r *controller) Prepare(ctx context.Context) error {
 		}
 	}
 	if err := r.adapter.create(ctx); err != nil {
-		if isContainerCreateNameConflict(err) {
+		if cerrdefs.IsConflict(err) {
 			if _, err := r.adapter.inspect(ctx); err != nil {
 				return err
 			}
@@ -209,7 +210,7 @@ func (r *controller) Start(ctx context.Context) error {
 	//
 	// TODO(stevvooe): This is very racy. While reading inspect, another could
 	// start the process and we could end up starting it twice.
-	if ctnr.State.Status != "created" {
+	if ctnr.State.Status != container.StateCreated {
 		return exec.ErrTaskStarted
 	}
 
@@ -254,7 +255,7 @@ func (r *controller) Start(ctx context.Context) error {
 			}
 
 			switch event.Action {
-			case "die": // exit on terminal events
+			case events.ActionDie: // exit on terminal events
 				ctnr, err := r.adapter.inspect(ctx)
 				if err != nil {
 					return errors.Wrap(err, "die event received")
@@ -263,23 +264,25 @@ func (r *controller) Start(ctx context.Context) error {
 				}
 
 				return nil
-			case "destroy":
+			case events.ActionDestroy:
 				// If we get here, something has gone wrong but we want to exit
 				// and report anyways.
 				return ErrContainerDestroyed
-			case "health_status: unhealthy":
+			case events.ActionHealthStatusUnhealthy:
 				// in this case, we stop the container and report unhealthy status
 				if err := r.Shutdown(ctx); err != nil {
 					return errors.Wrap(err, "unhealthy container shutdown failed")
 				}
 				// set health check error, and wait for container to fully exit ("die" event)
 				healthErr = ErrContainerUnhealthy
-			case "health_status: healthy":
+			case events.ActionHealthStatusHealthy:
 				if err := r.adapter.activateServiceBinding(); err != nil {
 					log.G(ctx).WithError(err).Errorf("failed to activate service binding for container %s after healthy event", r.adapter.container.name())
 					return err
 				}
 				return nil
+			default:
+				// TODO(thaJeztah): make switch exhaustive
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -302,7 +305,7 @@ func (r *controller) Wait(pctx context.Context) error {
 	go func() {
 		ectx, cancel := context.WithCancel(ctx) // cancel event context on first event
 		defer cancel()
-		if err := r.checkHealth(ectx); err == ErrContainerUnhealthy {
+		if err := r.checkHealth(ectx); errors.Is(err, ErrContainerUnhealthy) {
 			healthErr <- ErrContainerUnhealthy
 			if err := r.Shutdown(ectx); err != nil {
 				log.G(ectx).WithError(err).Debug("shutdown failed on unhealthy")
@@ -379,7 +382,7 @@ func (r *controller) Shutdown(ctx context.Context) error {
 	}
 
 	if err := r.adapter.shutdown(ctx); err != nil {
-		if !(isUnknownContainer(err) || isStoppedContainer(err)) {
+		if !cerrdefs.IsNotFound(err) && !cerrdefs.IsNotModified(err) {
 			return err
 		}
 	}
@@ -387,7 +390,7 @@ func (r *controller) Shutdown(ctx context.Context) error {
 	// Try removing networks referenced in this task in case this
 	// task is the last one referencing it
 	if err := r.adapter.removeNetworks(ctx); err != nil {
-		if !isUnknownContainer(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return err
 		}
 	}
@@ -406,7 +409,7 @@ func (r *controller) Terminate(ctx context.Context) error {
 	}
 
 	if err := r.adapter.terminate(ctx); err != nil {
-		if isUnknownContainer(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 
@@ -428,7 +431,7 @@ func (r *controller) Remove(ctx context.Context) error {
 
 	// It may be necessary to shut down the task before removing it.
 	if err := r.Shutdown(ctx); err != nil {
-		if isUnknownContainer(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		// This may fail if the task was already shut down.
@@ -436,7 +439,7 @@ func (r *controller) Remove(ctx context.Context) error {
 	}
 
 	if err := r.adapter.remove(ctx); err != nil {
-		if isUnknownContainer(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 
@@ -459,13 +462,15 @@ func (r *controller) waitReady(pctx context.Context) error {
 
 	ctnr, err := r.adapter.inspect(ctx)
 	if err != nil {
-		if !isUnknownContainer(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return errors.Wrap(err, "inspect container failed")
 		}
 	} else {
 		switch ctnr.State.Status {
-		case "running", "exited", "dead":
+		case container.StateRunning, container.StateExited, container.StateDead:
 			return nil
+		case container.StateCreated, container.StatePaused, container.StateRestarting, container.StateRemoving:
+			// not yet ready
 		}
 	}
 
@@ -479,6 +484,8 @@ func (r *controller) waitReady(pctx context.Context) error {
 			switch event.Action {
 			case "start":
 				return nil
+			default:
+				// TODO(thaJeztah): make switch exhaustive
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -549,9 +556,10 @@ func (r *controller) Logs(ctx context.Context, publisher exec.LogPublisher, opti
 			return errors.Wrap(err, "failed to convert timestamp")
 		}
 		var stream api.LogStream
-		if msg.Source == "stdout" {
+		switch msg.Source {
+		case "stdout":
 			stream = api.LogStreamStdout
-		} else if msg.Source == "stderr" {
+		case "stderr":
 			stream = api.LogStreamStderr
 		}
 
@@ -609,7 +617,7 @@ func (r *controller) checkClosed() error {
 	}
 }
 
-func parseContainerStatus(ctnr types.ContainerJSON) (*api.ContainerStatus, error) {
+func parseContainerStatus(ctnr container.InspectResponse) (*api.ContainerStatus, error) {
 	status := &api.ContainerStatus{
 		ContainerID: ctnr.ID,
 		PID:         int32(ctnr.State.Pid),
@@ -619,7 +627,7 @@ func parseContainerStatus(ctnr types.ContainerJSON) (*api.ContainerStatus, error
 	return status, nil
 }
 
-func parsePortStatus(ctnr types.ContainerJSON) (*api.PortStatus, error) {
+func parsePortStatus(ctnr container.InspectResponse) (*api.PortStatus, error) {
 	status := &api.PortStatus{}
 
 	if ctnr.NetworkSettings != nil && len(ctnr.NetworkSettings.Ports) > 0 {
@@ -700,6 +708,10 @@ func (e *exitError) Cause() error {
 	return e.cause
 }
 
+func (e *exitError) Unwrap() error {
+	return e.cause
+}
+
 // checkHealth blocks until unhealthy container is detected or ctx exits
 func (r *controller) checkHealth(ctx context.Context) error {
 	eventq := r.adapter.events(ctx)
@@ -714,9 +726,7 @@ func (r *controller) checkHealth(ctx context.Context) error {
 			if !r.matchevent(event) {
 				continue
 			}
-
-			switch event.Action {
-			case "health_status: unhealthy":
+			if event.Action == events.ActionHealthStatusUnhealthy {
 				return ErrContainerUnhealthy
 			}
 		}

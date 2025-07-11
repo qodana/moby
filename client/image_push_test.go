@@ -1,17 +1,20 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImagePushReferenceError(t *testing.T) {
@@ -21,82 +24,72 @@ func TestImagePushReferenceError(t *testing.T) {
 		}),
 	}
 	// An empty reference is an invalid reference
-	_, err := client.ImagePush(context.Background(), "", types.ImagePushOptions{})
-	if err == nil || !strings.Contains(err.Error(), "invalid reference format") {
-		t.Fatalf("expected an error, got %v", err)
-	}
+	_, err := client.ImagePush(context.Background(), "", image.PushOptions{})
+	assert.Check(t, is.ErrorContains(err, "invalid reference format"))
 	// An canonical reference cannot be pushed
-	_, err = client.ImagePush(context.Background(), "repo@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", types.ImagePushOptions{})
-	if err == nil || err.Error() != "cannot push a digest reference" {
-		t.Fatalf("expected an error, got %v", err)
-	}
+	_, err = client.ImagePush(context.Background(), "repo@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", image.PushOptions{})
+	assert.Check(t, is.Error(err, "cannot push a digest reference"))
 }
 
 func TestImagePushAnyError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	_, err := client.ImagePush(context.Background(), "myimage", types.ImagePushOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err := client.ImagePush(context.Background(), "myimage", image.PushOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImagePushStatusUnauthorizedError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	_, err := client.ImagePush(context.Background(), "myimage", types.ImagePushOptions{})
-	if !errdefs.IsUnauthorized(err) {
-		t.Fatalf("expected a Unauthorized Error, got %[1]T: %[1]v", err)
-	}
+	_, err := client.ImagePush(context.Background(), "myimage", image.PushOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsUnauthorized))
 }
 
 func TestImagePushWithUnauthorizedErrorAndPrivilegeFuncError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	privilegeFunc := func() (string, error) {
-		return "", fmt.Errorf("Error requesting privilege")
+	privilegeFunc := func(_ context.Context) (string, error) {
+		return "", errors.New("Error requesting privilege")
 	}
-	_, err := client.ImagePush(context.Background(), "myimage", types.ImagePushOptions{
+	_, err := client.ImagePush(context.Background(), "myimage", image.PushOptions{
 		PrivilegeFunc: privilegeFunc,
 	})
-	if err == nil || err.Error() != "Error requesting privilege" {
-		t.Fatalf("expected an error requesting privilege, got %v", err)
-	}
+	assert.Check(t, is.Error(err, "Error requesting privilege"))
 }
 
 func TestImagePushWithUnauthorizedErrorAndAnotherUnauthorizedError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	privilegeFunc := func() (string, error) {
+	privilegeFunc := func(_ context.Context) (string, error) {
 		return "a-auth-header", nil
 	}
-	_, err := client.ImagePush(context.Background(), "myimage", types.ImagePushOptions{
+	_, err := client.ImagePush(context.Background(), "myimage", image.PushOptions{
 		PrivilegeFunc: privilegeFunc,
 	})
-	if !errdefs.IsUnauthorized(err) {
-		t.Fatalf("expected a Unauthorized Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsUnauthorized))
 }
 
 func TestImagePushWithPrivilegedFuncNoError(t *testing.T) {
-	expectedURL := "/images/myimage/push"
+	const expectedURL = "/images/docker.io/myname/myimage/push"
+	const invalidAuth = "NotValid"
+	const validAuth = "IAmValid"
 	client := &Client{
 		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
 			auth := req.Header.Get(registry.AuthHeader)
-			if auth == "NotValid" {
+			if auth == invalidAuth {
 				return &http.Response{
 					StatusCode: http.StatusUnauthorized,
 					Body:       io.NopCloser(bytes.NewReader([]byte("Invalid credentials"))),
 				}, nil
 			}
-			if auth != "IAmValid" {
+			if auth != validAuth {
 				return nil, fmt.Errorf("invalid auth header: expected %s, got %s", "IAmValid", auth)
 			}
 			query := req.URL.Query()
@@ -110,28 +103,21 @@ func TestImagePushWithPrivilegedFuncNoError(t *testing.T) {
 			}, nil
 		}),
 	}
-	privilegeFunc := func() (string, error) {
-		return "IAmValid", nil
-	}
-	resp, err := client.ImagePush(context.Background(), "myimage:tag", types.ImagePushOptions{
-		RegistryAuth:  "NotValid",
-		PrivilegeFunc: privilegeFunc,
+	resp, err := client.ImagePush(context.Background(), "myname/myimage:tag", image.PushOptions{
+		RegistryAuth:  invalidAuth,
+		PrivilegeFunc: staticAuth(validAuth),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 	body, err := io.ReadAll(resp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "hello world" {
-		t.Fatalf("expected 'hello world', got %s", string(body))
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(body), "hello world"))
 }
 
 func TestImagePushWithoutErrors(t *testing.T) {
-	expectedOutput := "hello world"
-	expectedURLFormat := "/images/%s/push"
+	const (
+		expectedURLFormat = "/images/%s/push"
+		expectedOutput    = "hello world"
+	)
 	testCases := []struct {
 		all           bool
 		reference     string
@@ -141,30 +127,54 @@ func TestImagePushWithoutErrors(t *testing.T) {
 		{
 			all:           false,
 			reference:     "myimage",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "latest",
 		},
 		{
 			all:           false,
 			reference:     "myimage:tag",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "tag",
 		},
 		{
 			all:           true,
 			reference:     "myimage",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "",
 		},
 		{
 			all:           true,
 			reference:     "myimage:anything",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "",
+		},
+		{
+			reference:     "myname/myimage",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "docker.io/myname/myimage",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "index.docker.io/myname/myimage:tag",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "tag",
+		},
+		{
+			reference:     "localhost/myname/myimage",
+			expectedImage: "localhost/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "registry.example.com:5000/myimage:tag",
+			expectedImage: "registry.example.com:5000/myimage",
+			expectedTag:   "tag",
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(fmt.Sprintf("%s,all-tags=%t", tc.reference, tc.all), func(t *testing.T) {
 			client := &Client{
 				client: newMockClient(func(req *http.Request) (*http.Response, error) {
@@ -183,19 +193,13 @@ func TestImagePushWithoutErrors(t *testing.T) {
 					}, nil
 				}),
 			}
-			resp, err := client.ImagePush(context.Background(), tc.reference, types.ImagePushOptions{
+			resp, err := client.ImagePush(context.Background(), tc.reference, image.PushOptions{
 				All: tc.all,
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			assert.NilError(t, err)
 			body, err := io.ReadAll(resp)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(body) != expectedOutput {
-				t.Fatalf("expected '%s', got %s", expectedOutput, string(body))
-			}
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(string(body), expectedOutput))
 		})
 	}
 }

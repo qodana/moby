@@ -1,4 +1,4 @@
-package git // import "github.com/docker/docker/builder/remotecontext/git"
+package git
 
 import (
 	"bytes"
@@ -113,7 +113,6 @@ func TestParseRemoteURL(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			repo, err := parseRemoteURL(tc.url)
 			assert.NilError(t, err)
@@ -217,14 +216,15 @@ func TestCheckoutGit(t *testing.T) {
 	server := httptest.NewServer(&githttp)
 	defer server.Close()
 
-	autocrlf := gitGetConfig("core.autocrlf")
-	if !(autocrlf == "true" || autocrlf == "false" ||
-		autocrlf == "input" || autocrlf == "") {
-		t.Logf("unknown core.autocrlf value: \"%s\"", autocrlf)
-	}
 	eol := "\n"
-	if autocrlf == "true" {
+	autocrlf := gitGetConfig("core.autocrlf")
+	switch autocrlf {
+	case "true":
 		eol = "\r\n"
+	case "false", "input", "":
+		// accepted values
+	default:
+		t.Logf(`unknown core.autocrlf value: "%s"`, autocrlf)
 	}
 
 	must := func(out []byte, err error) {
@@ -239,11 +239,11 @@ func TestCheckoutGit(t *testing.T) {
 	must(gitRepo{}.gitWithinDir(root, "-c", "init.defaultBranch=master", "init", gitDir))
 	must(gitRepo{}.gitWithinDir(gitDir, "config", "user.email", "test@docker.com"))
 	must(gitRepo{}.gitWithinDir(gitDir, "config", "user.name", "Docker test"))
-	assert.NilError(t, os.WriteFile(filepath.Join(gitDir, "Dockerfile"), []byte("FROM scratch"), 0644))
+	assert.NilError(t, os.WriteFile(filepath.Join(gitDir, "Dockerfile"), []byte("FROM scratch"), 0o644))
 
 	subDir := filepath.Join(gitDir, "subdir")
-	assert.NilError(t, os.Mkdir(subDir, 0755))
-	assert.NilError(t, os.WriteFile(filepath.Join(subDir, "Dockerfile"), []byte("FROM scratch\nEXPOSE 5000"), 0644))
+	assert.NilError(t, os.Mkdir(subDir, 0o755))
+	assert.NilError(t, os.WriteFile(filepath.Join(subDir, "Dockerfile"), []byte("FROM scratch\nEXPOSE 5000"), 0o644))
 
 	if runtime.GOOS != "windows" {
 		assert.NilError(t, os.Symlink("../subdir", filepath.Join(gitDir, "parentlink")))
@@ -254,8 +254,8 @@ func TestCheckoutGit(t *testing.T) {
 	must(gitRepo{}.gitWithinDir(gitDir, "commit", "-am", "First commit"))
 	must(gitRepo{}.gitWithinDir(gitDir, "checkout", "-b", "test"))
 
-	assert.NilError(t, os.WriteFile(filepath.Join(gitDir, "Dockerfile"), []byte("FROM scratch\nEXPOSE 3000"), 0644))
-	assert.NilError(t, os.WriteFile(filepath.Join(subDir, "Dockerfile"), []byte("FROM busybox\nEXPOSE 5000"), 0644))
+	assert.NilError(t, os.WriteFile(filepath.Join(gitDir, "Dockerfile"), []byte("FROM scratch\nEXPOSE 3000"), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(subDir, "Dockerfile"), []byte("FROM busybox\nEXPOSE 5000"), 0o644))
 
 	must(gitRepo{}.gitWithinDir(gitDir, "add", "-A"))
 	must(gitRepo{}.gitWithinDir(gitDir, "commit", "-am", "Branch commit"))
@@ -267,7 +267,7 @@ func TestCheckoutGit(t *testing.T) {
 	must(gitRepo{}.gitWithinDir(subrepoDir, "config", "user.email", "test@docker.com"))
 	must(gitRepo{}.gitWithinDir(subrepoDir, "config", "user.name", "Docker test"))
 
-	assert.NilError(t, os.WriteFile(filepath.Join(subrepoDir, "subfile"), []byte("subcontents"), 0644))
+	assert.NilError(t, os.WriteFile(filepath.Join(subrepoDir, "subfile"), []byte("subcontents"), 0o644))
 
 	must(gitRepo{}.gitWithinDir(subrepoDir, "add", "-A"))
 	must(gitRepo{}.gitWithinDir(subrepoDir, "commit", "-am", "Subrepo initial"))
@@ -325,7 +325,7 @@ func TestCheckoutGit(t *testing.T) {
 				assert.Check(t, is.Equal("subcontents", string(b)))
 			} else {
 				_, err := os.Stat(filepath.Join(r, "sub/subfile"))
-				assert.Assert(t, is.ErrorContains(err, ""))
+				assert.ErrorContains(t, err, "")
 				assert.Assert(t, os.IsNotExist(err))
 			}
 
@@ -374,6 +374,8 @@ func TestGitInvalidRef(t *testing.T) {
 	for _, url := range gitUrls {
 		_, err := Clone(url)
 		assert.Assert(t, err != nil)
+		// On Windows, git has different case for the "invalid refspec" error,
+		// so we can't use ErrorContains.
 		assert.Check(t, is.Contains(strings.ToLower(err.Error()), "invalid refspec"))
 	}
 }

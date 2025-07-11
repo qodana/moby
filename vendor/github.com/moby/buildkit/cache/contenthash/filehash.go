@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/pkg/errors"
 	fstypes "github.com/tonistiigi/fsutil/types"
 )
 
@@ -24,7 +25,7 @@ func NewFileHash(path string, fi os.FileInfo) (hash.Hash, error) {
 
 	stat := &fstypes.Stat{
 		Mode:     uint32(fi.Mode()),
-		Size_:    fi.Size(),
+		Size:     fi.Size(),
 		ModTime:  fi.ModTime().UnixNano(),
 		Linkname: link,
 	}
@@ -40,13 +41,13 @@ func NewFileHash(path string, fi os.FileInfo) (hash.Hash, error) {
 }
 
 func NewFromStat(stat *fstypes.Stat) (hash.Hash, error) {
-	// Clear the socket bit since archive/tar.FileInfoHeader does not handle it
-	stat.Mode &^= uint32(os.ModeSocket)
+	// Clear the socket and irregular bits since archive/tar.FileInfoHeader does not handle them
+	stat.Mode &^= uint32(os.ModeSocket | os.ModeIrregular)
 
 	fi := &statInfo{stat}
 	hdr, err := tar.FileInfoHeader(fi, stat.Linkname)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to checksum file %s", stat.Path)
 	}
 	hdr.Name = "" // note: empty name is different from current has in docker build. Name is added on recursive directory scan instead
 	hdr.Devmajor = stat.Devmajor
@@ -83,20 +84,25 @@ type statInfo struct {
 }
 
 func (s *statInfo) Name() string {
-	return filepath.Base(s.Stat.Path)
+	return filepath.Base(s.Path)
 }
+
 func (s *statInfo) Size() int64 {
-	return s.Stat.Size_
+	return s.Stat.Size
 }
+
 func (s *statInfo) Mode() os.FileMode {
 	return os.FileMode(s.Stat.Mode)
 }
+
 func (s *statInfo) ModTime() time.Time {
 	return time.Unix(s.Stat.ModTime/1e9, s.Stat.ModTime%1e9)
 }
+
 func (s *statInfo) IsDir() bool {
 	return s.Mode().IsDir()
 }
-func (s *statInfo) Sys() interface{} {
+
+func (s *statInfo) Sys() any {
 	return s.Stat
 }

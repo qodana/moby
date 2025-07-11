@@ -1,11 +1,12 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
-	"github.com/pkg/errors"
+	cerrdefs "github.com/containerd/errdefs"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -26,7 +27,5 @@ func TestDistributionInspectWithEmptyID(t *testing.T) {
 		}),
 	}
 	_, err := client.DistributionInspect(context.Background(), "", "")
-	if !IsErrNotFound(err) {
-		t.Fatalf("Expected NotFoundError, got %v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }

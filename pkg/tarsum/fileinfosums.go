@@ -1,4 +1,4 @@
-package tarsum // import "github.com/docker/docker/pkg/tarsum"
+package tarsum
 
 import (
 	"runtime"
@@ -27,9 +27,11 @@ type fileInfoSum struct {
 func (fis fileInfoSum) Name() string {
 	return fis.name
 }
+
 func (fis fileInfoSum) Sum() string {
 	return fis.sum
 }
+
 func (fis fileInfoSum) Pos() int64 {
 	return fis.pos
 }

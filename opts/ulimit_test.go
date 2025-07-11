@@ -1,13 +1,13 @@
-package opts // import "github.com/docker/docker/opts"
+package opts
 
 import (
 	"testing"
 
-	units "github.com/docker/go-units"
+	"github.com/docker/docker/api/types/container"
 )
 
 func TestUlimitOpt(t *testing.T) {
-	ulimitMap := map[string]*units.Ulimit{
+	ulimitMap := map[string]*container.Ulimit{
 		"nofile": {Name: "nofile", Hard: 1024, Soft: 512},
 	}
 

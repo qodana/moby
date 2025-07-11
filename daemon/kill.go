@@ -1,4 +1,4 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
@@ -8,11 +8,14 @@ import (
 	"syscall"
 	"time"
 
-	containerpkg "github.com/docker/docker/container"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	containerpkg "github.com/docker/docker/daemon/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/moby/sys/signal"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type errNoSuchProcess struct {
@@ -61,7 +64,10 @@ func (daemon *Daemon) ContainerKill(name, stopSignal string) error {
 // or not running, or if there is a problem returned from the
 // underlying kill command.
 func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSignal syscall.Signal) error {
-	logrus.Debugf("Sending kill signal %d to container %s", stopSignal, container.ID)
+	log.G(context.TODO()).WithFields(log.Fields{
+		"signal":    int(stopSignal),
+		"container": container.ID,
+	}).Debugf("sending signal %[1]d (%[1]s) to container", stopSignal)
 	container.Lock()
 	defer container.Unlock()
 
@@ -87,7 +93,12 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 
 	if !daemon.IsShuttingDown() {
 		container.HasBeenManuallyStopped = true
-		container.CheckpointTo(daemon.containersReplica)
+		if err := container.CheckpointTo(context.WithoutCancel(context.TODO()), daemon.containersReplica); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":     err,
+				"container": container.ID,
+			}).Warn("error checkpointing container state")
+		}
 	}
 
 	// if the container is currently restarting we do not need to send the signal
@@ -98,20 +109,30 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 	}
 
 	if err := task.Kill(context.Background(), stopSignal); err != nil {
-		if errdefs.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			unpause = false
-			logrus.WithError(err).WithField("container", container.ID).WithField("action", "kill").Debug("container kill failed because of 'container not found' or 'no such process'")
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":     err,
+				"container": container.ID,
+				"action":    "kill",
+			}).Debug("container kill failed because of 'container not found' or 'no such process'")
 			go func() {
 				// We need to clean up this container but it is possible there is a case where we hit here before the exit event is processed
 				// but after it was fired off.
 				// So let's wait the container's stop timeout amount of time to see if the event is eventually processed.
-				// Doing this has the side effect that if no event was ever going to come we are waiting a a longer period of time uneccessarily.
+				// Doing this has the side effect that if no event was ever going to come we are waiting a longer period of time unnecessarily.
 				// But this prevents race conditions in processing the container.
 				ctx, cancel := context.WithTimeout(context.TODO(), time.Duration(container.StopTimeout())*time.Second)
 				defer cancel()
-				s := <-container.Wait(ctx, containerpkg.WaitConditionNotRunning)
+				s := <-container.Wait(ctx, containertypes.WaitConditionNotRunning)
 				if s.Err() != nil {
-					daemon.handleContainerExit(container, nil)
+					if err := daemon.handleContainerExit(container, nil); err != nil {
+						log.G(context.TODO()).WithFields(log.Fields{
+							"error":     err,
+							"container": container.ID,
+							"action":    "kill",
+						}).Warn("error while handling container exit")
+					}
 				}
 			}()
 		} else {
@@ -122,11 +143,15 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 	if unpause {
 		// above kill signal will be sent once resume is finished
 		if err := task.Resume(context.Background()); err != nil {
-			logrus.Warnf("Cannot unpause container %s: %s", container.ID, err)
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":     err,
+				"container": container.ID,
+				"action":    "kill",
+			}).Warn("cannot unpause container")
 		}
 	}
 
-	daemon.LogContainerEventWithAttributes(container, "kill", map[string]string{
+	daemon.LogContainerEventWithAttributes(container, events.ActionKill, map[string]string{
 		"signal": strconv.Itoa(int(stopSignal)),
 	})
 	return nil
@@ -154,12 +179,12 @@ func (daemon *Daemon) Kill(container *containerpkg.Container) error {
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
 	defer cancel()
 
-	status := <-container.Wait(ctx, containerpkg.WaitConditionNotRunning)
+	status := <-container.Wait(ctx, containertypes.WaitConditionNotRunning)
 	if status.Err() == nil {
 		return nil
 	}
 
-	logrus.WithError(status.Err()).WithField("container", container.ID).Errorf("Container failed to exit within %v of kill - trying direct SIGKILL", waitTimeout)
+	log.G(ctx).WithFields(log.Fields{"error": status.Err(), "container": container.ID}).Warnf("Container failed to exit within %v of kill - trying direct SIGKILL", waitTimeout)
 
 	if err := killProcessDirectly(container); err != nil {
 		if errors.As(err, &errNoSuchProcess{}) {
@@ -172,7 +197,7 @@ func (daemon *Daemon) Kill(container *containerpkg.Container) error {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
 
-	if status := <-container.Wait(ctx2, containerpkg.WaitConditionNotRunning); status.Err() != nil {
+	if status := <-container.Wait(ctx2, containertypes.WaitConditionNotRunning); status.Err() != nil {
 		return errors.New("tried to kill container, but did not receive an exit event")
 	}
 	return nil
@@ -181,9 +206,9 @@ func (daemon *Daemon) Kill(container *containerpkg.Container) error {
 // killPossiblyDeadProcess is a wrapper around killSig() suppressing "no such process" error.
 func (daemon *Daemon) killPossiblyDeadProcess(container *containerpkg.Container, sig syscall.Signal) error {
 	err := daemon.killWithSignal(container, sig)
-	if errdefs.IsNotFound(err) {
+	if cerrdefs.IsNotFound(err) {
 		err = errNoSuchProcess{container.GetPID(), sig}
-		logrus.Debug(err)
+		log.G(context.TODO()).Debug(err)
 		return err
 	}
 	return err

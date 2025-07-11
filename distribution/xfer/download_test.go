@@ -1,4 +1,4 @@
-package xfer // import "github.com/docker/docker/distribution/xfer"
+package xfer
 
 import (
 	"bytes"
@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/docker/distribution"
-	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
 	"gotest.tools/v3/assert"
 )
 
@@ -33,7 +33,7 @@ func (ml *mockLayer) TarStream() (io.ReadCloser, error) {
 }
 
 func (ml *mockLayer) TarStreamFrom(layer.ChainID) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("not implemented")
+	return nil, errors.New("not implemented")
 }
 
 func (ml *mockLayer) ChainID() layer.ChainID {
@@ -64,18 +64,6 @@ type mockLayerStore struct {
 	layers map[layer.ChainID]*mockLayer
 }
 
-func createChainIDFromParent(parent layer.ChainID, dgsts ...layer.DiffID) layer.ChainID {
-	if len(dgsts) == 0 {
-		return parent
-	}
-	if parent == "" {
-		return createChainIDFromParent(layer.ChainID(dgsts[0]), dgsts[1:]...)
-	}
-	// H = "H(n-1) SHA256(n)"
-	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0])))
-	return createChainIDFromParent(layer.ChainID(dgst), dgsts[1:]...)
-}
-
 func (ls *mockLayerStore) Map() map[layer.ChainID]layer.Layer {
 	layers := map[layer.ChainID]layer.Layer{}
 
@@ -96,11 +84,13 @@ func (ls *mockLayerStore) RegisterWithDescriptor(reader io.Reader, parentID laye
 		err    error
 	)
 
+	var diffIDs []layer.DiffID
 	if parentID != "" {
 		parent, err = ls.Get(parentID)
 		if err != nil {
 			return nil, err
 		}
+		diffIDs = append(diffIDs, parentID)
 	}
 
 	l := &mockLayer{parent: parent}
@@ -108,8 +98,9 @@ func (ls *mockLayerStore) RegisterWithDescriptor(reader io.Reader, parentID laye
 	if err != nil {
 		return nil, err
 	}
-	l.diffID = layer.DiffID(digest.FromBytes(l.layerData.Bytes()))
-	l.chainID = createChainIDFromParent(parentID, l.diffID)
+	l.diffID = digest.FromBytes(l.layerData.Bytes())
+	diffIDs = append(diffIDs, l.diffID)
+	l.chainID = identity.ChainID(diffIDs)
 
 	ls.layers[l.chainID] = l
 	return l, nil
@@ -126,6 +117,7 @@ func (ls *mockLayerStore) Get(chainID layer.ChainID) (layer.Layer, error) {
 func (ls *mockLayerStore) Release(l layer.Layer) ([]layer.Metadata, error) {
 	return []layer.Metadata{}, nil
 }
+
 func (ls *mockLayerStore) CreateRWLayer(string, layer.ChainID, *layer.CreateRWLayerOpts) (layer.RWLayer, error) {
 	return nil, errors.New("not implemented")
 }
@@ -137,6 +129,7 @@ func (ls *mockLayerStore) GetRWLayer(string) (layer.RWLayer, error) {
 func (ls *mockLayerStore) ReleaseRWLayer(layer.RWLayer) ([]layer.Metadata, error) {
 	return nil, errors.New("not implemented")
 }
+
 func (ls *mockLayerStore) GetMountID(string) (string, error) {
 	return "", errors.New("not implemented")
 }
@@ -154,7 +147,7 @@ func (ls *mockLayerStore) DriverName() string {
 }
 
 type mockDownloadDescriptor struct {
-	currentDownloads *int32
+	currentDownloads *atomic.Int32
 	id               string
 	diffID           layer.DiffID
 	registeredDiffID layer.DiffID
@@ -191,15 +184,15 @@ func (d *mockDownloadDescriptor) mockTarStream() io.ReadCloser {
 	// The mock implementation returns the ID repeated 5 times as a tar
 	// stream instead of actual tar data. The data is ignored except for
 	// computing IDs.
-	return io.NopCloser(bytes.NewBuffer([]byte(d.id + d.id + d.id + d.id + d.id)))
+	return io.NopCloser(bytes.NewBufferString(d.id + d.id + d.id + d.id + d.id))
 }
 
 // Download is called to perform the download.
 func (d *mockDownloadDescriptor) Download(ctx context.Context, progressOutput progress.Output) (io.ReadCloser, int64, error) {
 	if d.currentDownloads != nil {
-		defer atomic.AddInt32(d.currentDownloads, -1)
+		defer d.currentDownloads.Add(-1)
 
-		if atomic.AddInt32(d.currentDownloads, 1) > maxDownloadConcurrency {
+		if d.currentDownloads.Add(1) > maxDownloadConcurrency {
 			return nil, 0, errors.New("concurrency limit exceeded")
 		}
 	}
@@ -225,38 +218,38 @@ func (d *mockDownloadDescriptor) Download(ctx context.Context, progressOutput pr
 func (d *mockDownloadDescriptor) Close() {
 }
 
-func downloadDescriptors(currentDownloads *int32) []DownloadDescriptor {
+func downloadDescriptors(currentDownloads *atomic.Int32) []DownloadDescriptor {
 	return []DownloadDescriptor{
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id1",
-			expectedDiffID:   layer.DiffID("sha256:68e2c75dc5c78ea9240689c60d7599766c213ae210434c53af18470ae8c53ec1"),
+			expectedDiffID:   "sha256:68e2c75dc5c78ea9240689c60d7599766c213ae210434c53af18470ae8c53ec1",
 		},
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id2",
-			expectedDiffID:   layer.DiffID("sha256:64a636223116aa837973a5d9c2bdd17d9b204e4f95ac423e20e65dfbb3655473"),
+			expectedDiffID:   "sha256:64a636223116aa837973a5d9c2bdd17d9b204e4f95ac423e20e65dfbb3655473",
 		},
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id3",
-			expectedDiffID:   layer.DiffID("sha256:58745a8bbd669c25213e9de578c4da5c8ee1c836b3581432c2b50e38a6753300"),
+			expectedDiffID:   "sha256:58745a8bbd669c25213e9de578c4da5c8ee1c836b3581432c2b50e38a6753300",
 		},
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id2",
-			expectedDiffID:   layer.DiffID("sha256:64a636223116aa837973a5d9c2bdd17d9b204e4f95ac423e20e65dfbb3655473"),
+			expectedDiffID:   "sha256:64a636223116aa837973a5d9c2bdd17d9b204e4f95ac423e20e65dfbb3655473",
 		},
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id4",
-			expectedDiffID:   layer.DiffID("sha256:0dfb5b9577716cc173e95af7c10289322c29a6453a1718addc00c0c5b1330936"),
+			expectedDiffID:   "sha256:0dfb5b9577716cc173e95af7c10289322c29a6453a1718addc00c0c5b1330936",
 			simulateRetries:  1,
 		},
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
 			id:               "id5",
-			expectedDiffID:   layer.DiffID("sha256:0a5f25fa1acbc647f6112a6276735d0fa01e4ee2aa7ec33015e337350e1ea23d"),
+			expectedDiffID:   "sha256:0a5f25fa1acbc647f6112a6276735d0fa01e4ee2aa7ec33015e337350e1ea23d",
 		},
 	}
 }
@@ -281,7 +274,7 @@ func TestSuccessfulDownload(t *testing.T) {
 		close(progressDone)
 	}()
 
-	var currentDownloads int32
+	var currentDownloads atomic.Int32
 	descriptors := downloadDescriptors(&currentDownloads)
 
 	firstDescriptor := descriptors[0].(*mockDownloadDescriptor)
@@ -293,7 +286,7 @@ func TestSuccessfulDownload(t *testing.T) {
 	}
 	firstDescriptor.diffID = l.DiffID()
 
-	rootFS, releaseFunc, err := ldm.Download(context.Background(), *image.NewRootFS(), descriptors, progress.ChanOutput(progressChan))
+	rootFS, releaseFunc, err := ldm.Download(context.Background(), descriptors, progress.ChanOutput(progressChan))
 	if err != nil {
 		t.Fatalf("download error: %v", err)
 	}
@@ -311,11 +304,11 @@ func TestSuccessfulDownload(t *testing.T) {
 		descriptor := d.(*mockDownloadDescriptor)
 
 		if descriptor.diffID != "" {
-			if receivedProgress[d.ID()].Action != "Already exists" {
-				t.Fatalf("did not get 'Already exists' message for %v", d.ID())
+			if actual := receivedProgress[d.ID()].Action; actual != "Already exists" {
+				t.Fatalf("did not get 'Already exists' message for %v: got: %s", d.ID(), actual)
 			}
-		} else if receivedProgress[d.ID()].Action != "Pull complete" {
-			t.Fatalf("did not get 'Pull complete' message for %v", d.ID())
+		} else if actual := receivedProgress[d.ID()].Action; actual != "Pull complete" {
+			t.Fatalf("did not get 'Pull complete' message for %v: got: %s", d.ID(), actual)
 		}
 
 		if rootFS.DiffIDs[i] != descriptor.expectedDiffID {
@@ -348,8 +341,8 @@ func TestCancelledDownload(t *testing.T) {
 	}()
 
 	descriptors := downloadDescriptors(nil)
-	_, _, err := ldm.Download(ctx, *image.NewRootFS(), descriptors, progress.ChanOutput(progressChan))
-	if err != context.Canceled {
+	_, _, err := ldm.Download(ctx, descriptors, progress.ChanOutput(progressChan))
+	if !errors.Is(err, context.Canceled) {
 		close(progressChan)
 		t.Fatal("expected download to be cancelled")
 	}
@@ -389,7 +382,6 @@ func TestMaxDownloadAttempts(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			layerStore := &mockLayerStore{make(map[layer.ChainID]*mockLayer)}
@@ -410,11 +402,11 @@ func TestMaxDownloadAttempts(t *testing.T) {
 				close(progressDone)
 			}()
 
-			var currentDownloads int32
+			var currentDownloads atomic.Int32
 			descriptors := downloadDescriptors(&currentDownloads)
 			descriptors[4].(*mockDownloadDescriptor).simulateRetries = tc.simulateRetries
 
-			_, _, err := ldm.Download(context.Background(), *image.NewRootFS(), descriptors, progress.ChanOutput(progressChan))
+			_, _, err := ldm.Download(context.Background(), descriptors, progress.ChanOutput(progressChan))
 			if tc.expectedErr == "" {
 				assert.NilError(t, err)
 			} else {

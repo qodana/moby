@@ -1,9 +1,10 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
 	"fmt"
 
+	cerrdefs "github.com/containerd/errdefs"
 	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/daemon/cluster/convert"
 	"github.com/docker/docker/errdefs"
@@ -90,17 +91,16 @@ func (c *Cluster) RemoveVolume(nameOrID string, force bool) error {
 	return c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
 		volume, err := getVolume(ctx, state.controlClient, nameOrID)
 		if err != nil {
-			if force && errdefs.IsNotFound(err) {
+			if force && cerrdefs.IsNotFound(err) {
 				return nil
 			}
 			return err
 		}
 
-		req := &swarmapi.RemoveVolumeRequest{
+		_, err = state.controlClient.RemoveVolume(ctx, &swarmapi.RemoveVolumeRequest{
 			VolumeID: volume.ID,
 			Force:    force,
-		}
-		_, err = state.controlClient.RemoveVolume(ctx, req)
+		})
 		return err
 	})
 }
@@ -125,19 +125,18 @@ func (c *Cluster) UpdateVolume(nameOrID string, version uint64, volume volumetyp
 				v.Spec.Availability = swarmapi.VolumeAvailabilityPause
 			case volumetypes.AvailabilityDrain:
 				v.Spec.Availability = swarmapi.VolumeAvailabilityDrain
+			default:
+				// if default empty value, change nothing.
 			}
-			// if default empty value, change nothing.
 		}
 
-		_, err = state.controlClient.UpdateVolume(
-			ctx, &swarmapi.UpdateVolumeRequest{
-				VolumeID: nameOrID,
-				VolumeVersion: &swarmapi.Version{
-					Index: version,
-				},
-				Spec: &v.Spec,
+		_, err = state.controlClient.UpdateVolume(ctx, &swarmapi.UpdateVolumeRequest{
+			VolumeID: nameOrID,
+			VolumeVersion: &swarmapi.Version{
+				Index: version,
 			},
-		)
+			Spec: &v.Spec,
+		})
 		return err
 	})
 }

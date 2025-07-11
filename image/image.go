@@ -1,19 +1,19 @@
-package image // import "github.com/docker/docker/image"
+package image
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"reflect"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/layer"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // ID is the content-addressable ID of an image.
@@ -26,13 +26,6 @@ func (id ID) String() string {
 // Digest converts ID into a digest
 func (id ID) Digest() digest.Digest {
 	return digest.Digest(id)
-}
-
-// IDFromDigest creates an ID from a digest
-//
-// Deprecated: cast to an ID using ID(digest).
-func IDFromDigest(digest digest.Digest) ID {
-	return ID(digest)
 }
 
 // V1Image stores the V1 image configuration.
@@ -52,7 +45,7 @@ type V1Image struct {
 	Comment string `json:"comment,omitempty"`
 
 	// Created is the timestamp at which the image was created
-	Created time.Time `json:"created"`
+	Created *time.Time `json:"created"`
 
 	// Container is the ID of the container that was used to create the image.
 	//
@@ -122,11 +115,12 @@ type Image struct {
 
 // Details provides additional image data
 type Details struct {
-	References  []reference.Named
-	Size        int64
-	Metadata    map[string]string
-	Driver      string
-	LastUpdated time.Time
+	// ManifestDescriptor is the descriptor of the platform-specific manifest
+	// chosen by the [GetImage] call that returned this image.
+	// The exact descriptor depends on the [GetImageOpts.Platform] field
+	// passed to [GetImage] and the content availability.
+	// This is only set by the containerd image service.
+	ManifestDescriptor *ocispec.Descriptor
 }
 
 // RawJSON returns the immutable JSON associated with the image.
@@ -172,6 +166,17 @@ func (img *Image) OperatingSystem() string {
 		os = runtime.GOOS
 	}
 	return os
+}
+
+// Platform generates an OCI platform from the image
+func (img *Image) Platform() ocispec.Platform {
+	return ocispec.Platform{
+		Architecture: img.Architecture,
+		OS:           img.OS,
+		OSVersion:    img.OSVersion,
+		OSFeatures:   img.OSFeatures,
+		Variant:      img.Variant,
+	}
 }
 
 // MarshalJSON serializes the image to JSON. It sorts the top-level keys so
@@ -248,50 +253,36 @@ func NewChildImage(img *Image, child ChildConfig, os string) *Image {
 	}
 }
 
-// History stores build commands that were used to create an image
-type History struct {
-	// Created is the timestamp at which the image was created
-	Created time.Time `json:"created"`
-	// Author is the name of the author that was specified when committing the
-	// image, or as specified through MAINTAINER (deprecated) in the Dockerfile.
-	Author string `json:"author,omitempty"`
-	// CreatedBy keeps the Dockerfile command used while building the image
-	CreatedBy string `json:"created_by,omitempty"`
-	// Comment is the commit message that was set when committing the image
-	Comment string `json:"comment,omitempty"`
-	// EmptyLayer is set to true if this history item did not generate a
-	// layer. Otherwise, the history item is associated with the next
-	// layer in the RootFS section.
-	EmptyLayer bool `json:"empty_layer,omitempty"`
+// Clone clones an image and changes ID.
+func Clone(base *Image, id ID) *Image {
+	img := *base
+	img.RootFS = img.RootFS.Clone()
+	img.V1Image.ID = id.String()
+	img.computedID = id
+	return &img
 }
+
+// History stores build commands that were used to create an image
+type History = ocispec.History
 
 // NewHistory creates a new history struct from arguments, and sets the created
 // time to the current time in UTC
 func NewHistory(author, comment, createdBy string, isEmptyLayer bool) History {
+	now := time.Now().UTC()
 	return History{
 		Author:     author,
-		Created:    time.Now().UTC(),
+		Created:    &now,
 		CreatedBy:  createdBy,
 		Comment:    comment,
 		EmptyLayer: isEmptyLayer,
 	}
 }
 
-// Equal compares two history structs for equality
-func (h History) Equal(i History) bool {
-	if !h.Created.Equal(i.Created) {
-		return false
-	}
-	i.Created = h.Created
-
-	return reflect.DeepEqual(h, i)
-}
-
 // Exporter provides interface for loading and saving images
 type Exporter interface {
-	Load(io.ReadCloser, io.Writer, bool) error
+	Load(context.Context, io.ReadCloser, io.Writer, bool) error
 	// TODO: Load(net.Context, io.ReadCloser, <- chan StatusMessage) error
-	Save([]string, io.Writer) error
+	Save(context.Context, []string, io.Writer) error
 }
 
 // NewFromJSON creates an Image configuration from json.

@@ -18,6 +18,7 @@ package cgroup1
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/containerd/cgroups/v3"
 	units "github.com/docker/go-units"
+	"github.com/moby/sys/userns"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -52,7 +54,7 @@ func defaults(root string) ([]Subsystem, error) {
 	}
 	// only add the devices cgroup if we are not in a user namespace
 	// because modifications are not allowed
-	if !cgroups.RunningInUserNS() {
+	if !userns.RunningInUserNS() {
 		s = append(s, NewDevices(root))
 	}
 	// add the hugetlb cgroup if error wasn't due to missing hugetlb
@@ -131,11 +133,25 @@ func hugePageSizes() ([]string, error) {
 }
 
 func readUint(path string) (uint64, error) {
-	v, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
-	return parseUint(strings.TrimSpace(string(v)), 10, 64)
+	defer f.Close()
+
+	// We should only need 20 bytes for the max uint64, but for a nice power of 2
+	// lets use 32.
+	b := make([]byte, 32)
+	n, err := f.Read(b)
+	if err != nil {
+		return 0, err
+	}
+	s := string(bytes.TrimSpace(b[:n]))
+	if s == "max" {
+		// Return 0 for the max value to maintain backward compatibility.
+		return 0, nil
+	}
+	return parseUint(s, 10, 64)
 }
 
 func parseUint(s string, base, bitSize int) (uint64, error) {
@@ -181,7 +197,7 @@ func parseKV(raw string) (string, uint64, error) {
 // The resulting map does not have an element for cgroup v2 unified hierarchy.
 // Use [cgroups.ParseCgroupFileUnified] to get the unified path.
 func ParseCgroupFile(path string) (map[string]string, error) {
-	x, _, err := ParseCgroupFileUnified(path)
+	x, _, err := cgroups.ParseCgroupFileUnified(path)
 	return x, err
 }
 
@@ -221,9 +237,9 @@ func getCgroupDestination(subsystem string) (string, error) {
 	return "", ErrNoCgroupMountDestination
 }
 
-func pathers(subystems []Subsystem) []pather {
+func pathers(subsystems []Subsystem) []pather {
 	var out []pather
-	for _, s := range subystems {
+	for _, s := range subsystems {
 		if p, ok := s.(pather); ok {
 			out = append(out, p)
 		}

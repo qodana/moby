@@ -2,18 +2,18 @@
 //
 // Historically, only server-side Dockerfile interpreters existed.
 // This package allows for other implementations of Docker builders.
-package builder // import "github.com/docker/docker/builder"
+package builder
 
 import (
 	"context"
 	"io"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
-	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const (
@@ -44,8 +44,7 @@ type Backend interface {
 	CommitBuildStep(context.Context, backend.CommitConfig) (image.ID, error)
 	// ContainerCreateWorkdir creates the workdir
 	ContainerCreateWorkdir(containerID string) error
-
-	CreateImage(config []byte, parent string) (Image, error)
+	CreateImage(ctx context.Context, config []byte, parent string, contentStoreDigest digest.Digest) (Image, error)
 
 	ImageCacheBuilder
 }
@@ -60,15 +59,13 @@ type ExecBackend interface {
 	// ContainerAttachRaw attaches to container.
 	ContainerAttachRaw(cID string, stdin io.ReadCloser, stdout, stderr io.Writer, stream bool, attached chan struct{}) error
 	// ContainerCreateIgnoreImagesArgsEscaped creates a new Docker container and returns potential warnings
-	ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, config types.ContainerCreateConfig) (container.CreateResponse, error)
+	ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, config backend.ContainerCreateConfig) (container.CreateResponse, error)
 	// ContainerRm removes a container specified by `id`.
-	ContainerRm(name string, config *types.ContainerRmConfig) error
-	// ContainerKill stops the container execution abruptly.
-	ContainerKill(containerID string, sig string) error
+	ContainerRm(name string, config *backend.ContainerRmConfig) error
 	// ContainerStart starts a new container
-	ContainerStart(ctx context.Context, containerID string, hostConfig *container.HostConfig, checkpoint string, checkpointDir string) error
+	ContainerStart(ctx context.Context, containerID string, checkpoint string, checkpointDir string) error
 	// ContainerWait stops processing until the given container is stopped.
-	ContainerWait(ctx context.Context, name string, condition containerpkg.WaitCondition) (<-chan containerpkg.StateStatus, error)
+	ContainerWait(ctx context.Context, name string, condition container.WaitCondition) (<-chan container.StateStatus, error)
 }
 
 // Result is the output produced by a Builder
@@ -88,7 +85,7 @@ type ImageCacheBuilder interface {
 type ImageCache interface {
 	// GetCache returns a reference to a cached image whose parent equals `parent`
 	// and runconfig equals `cfg`. A cache miss is expected to return an empty ID and a nil error.
-	GetCache(parentID string, cfg *container.Config) (imageID string, err error)
+	GetCache(parentID string, cfg *container.Config, platform ocispec.Platform) (imageID string, err error)
 }
 
 // Image represents a Docker image used by the builder.
@@ -104,6 +101,7 @@ type ROLayer interface {
 	Release() error
 	NewRWLayer() (RWLayer, error)
 	DiffID() layer.DiffID
+	ContentStoreDigest() digest.Digest
 }
 
 // RWLayer is active layer that can be read/modified

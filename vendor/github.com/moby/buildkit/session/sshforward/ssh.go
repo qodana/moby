@@ -26,7 +26,7 @@ func (s *server) run(ctx context.Context, l net.Listener, id string) error {
 
 	eg.Go(func() error {
 		<-ctx.Done()
-		return ctx.Err()
+		return context.Cause(ctx)
 	})
 
 	eg.Go(func() error {
@@ -40,7 +40,7 @@ func (s *server) run(ctx context.Context, l net.Listener, id string) error {
 
 			opts := make(map[string][]string)
 			opts[KeySSHID] = []string{id}
-			ctx = metadata.NewOutgoingContext(ctx, opts)
+			ctx := metadata.NewOutgoingContext(ctx, opts)
 
 			stream, err := client.ForwardAgent(ctx)
 			if err != nil {

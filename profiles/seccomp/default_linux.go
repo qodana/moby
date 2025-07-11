@@ -1,4 +1,4 @@
-package seccomp // import "github.com/docker/docker/profiles/seccomp"
+package seccomp
 
 import (
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -56,6 +56,7 @@ func DefaultProfile() *Seccomp {
 					"alarm",
 					"bind",
 					"brk",
+					"cachestat", // kernel v6.5, libseccomp v2.5.5
 					"capget",
 					"capset",
 					"chdir",
@@ -101,6 +102,7 @@ func DefaultProfile() *Seccomp {
 					"fchdir",
 					"fchmod",
 					"fchmodat",
+					"fchmodat2", // kernel v6.6, libseccomp v2.5.5
 					"fchown",
 					"fchown32",
 					"fchownat",
@@ -122,8 +124,11 @@ func DefaultProfile() *Seccomp {
 					"ftruncate",
 					"ftruncate64",
 					"futex",
+					"futex_requeue", // kernel v6.7, libseccomp v2.5.5
 					"futex_time64",
+					"futex_wait", // kernel v6.7, libseccomp v2.5.5
 					"futex_waitv",
+					"futex_wake", // kernel v6.7, libseccomp v2.5.5
 					"futimesat",
 					"getcpu",
 					"getcwd",
@@ -161,6 +166,7 @@ func DefaultProfile() *Seccomp {
 					"getuid",
 					"getuid32",
 					"getxattr",
+					"getxattrat", // kernel v6.13, libseccomp v2.6.0
 					"inotify_add_watch",
 					"inotify_init",
 					"inotify_init1",
@@ -175,9 +181,6 @@ func DefaultProfile() *Seccomp {
 					"ioprio_set",
 					"io_setup",
 					"io_submit",
-					"io_uring_enter",
-					"io_uring_register",
-					"io_uring_setup",
 					"ipc",
 					"kill",
 					"landlock_add_rule",
@@ -189,7 +192,9 @@ func DefaultProfile() *Seccomp {
 					"link",
 					"linkat",
 					"listen",
+					"listmount", // kernel v6.8, libseccomp v2.6.0
 					"listxattr",
+					"listxattrat", // kernel v6.13, libseccomp v2.6.0
 					"llistxattr",
 					"_llseek",
 					"lremovexattr",
@@ -198,6 +203,7 @@ func DefaultProfile() *Seccomp {
 					"lstat",
 					"lstat64",
 					"madvise",
+					"map_shadow_stack", // kernel v6.6, libseccomp v2.5.5
 					"membarrier",
 					"memfd_create",
 					"memfd_secret",
@@ -221,6 +227,7 @@ func DefaultProfile() *Seccomp {
 					"mq_timedsend_time64",
 					"mq_unlink",
 					"mremap",
+					"mseal", // kernel v6.9, libseccomp v2.6.0
 					"msgctl",
 					"msgget",
 					"msgrcv",
@@ -229,6 +236,7 @@ func DefaultProfile() *Seccomp {
 					"munlock",
 					"munlockall",
 					"munmap",
+					"name_to_handle_at",
 					"nanosleep",
 					"newfstatat",
 					"_newselect",
@@ -269,10 +277,12 @@ func DefaultProfile() *Seccomp {
 					"recvmsg",
 					"remap_file_pages",
 					"removexattr",
+					"removexattrat", // kernel v6.13, libseccomp v2.6.0
 					"rename",
 					"renameat",
 					"renameat2",
 					"restart_syscall",
+					"riscv_hwprobe", // kernel v6.12, libseccomp v2.6.0
 					"rmdir",
 					"rseq",
 					"rt_sigaction",
@@ -338,6 +348,7 @@ func DefaultProfile() *Seccomp {
 					"setuid",
 					"setuid32",
 					"setxattr",
+					"setxattrat", // kernel v6.13, libseccomp v2.6.0
 					"shmat",
 					"shmctl",
 					"shmdt",
@@ -355,6 +366,7 @@ func DefaultProfile() *Seccomp {
 					"stat64",
 					"statfs",
 					"statfs64",
+					"statmount", // kernel v6.8, libseccomp v2.6.0
 					"statx",
 					"symlink",
 					"symlinkat",
@@ -386,6 +398,7 @@ func DefaultProfile() *Seccomp {
 					"uname",
 					"unlink",
 					"unlinkat",
+					"uretprobe", // kernel v6.11, libseccomp v2.6.0
 					"utime",
 					"utimensat",
 					"utimensat_time64",
@@ -589,10 +602,12 @@ func DefaultProfile() *Seccomp {
 					"fsopen",
 					"fspick",
 					"lookup_dcookie",
+					"lsm_get_self_attr", // kernel v6.8, libseccomp v2.6.0
+					"lsm_list_modules",  // kernel v6.8, libseccomp v2.6.0
+					"lsm_set_self_attr", // kernel v6.8, libseccomp v2.6.0
 					"mount",
 					"mount_setattr",
 					"move_mount",
-					"name_to_handle_at",
 					"open_tree",
 					"perf_event_open",
 					"quotactl",
@@ -771,6 +786,7 @@ func DefaultProfile() *Seccomp {
 					"get_mempolicy",
 					"mbind",
 					"set_mempolicy",
+					"set_mempolicy_home_node", // kernel v5.17, libseccomp v2.5.4
 				},
 				Action: specs.ActAllow,
 			},

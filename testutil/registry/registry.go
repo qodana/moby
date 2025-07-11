@@ -1,4 +1,4 @@
-package registry // import "github.com/docker/docker/testutil/registry"
+package registry
 
 import (
 	"fmt"
@@ -16,9 +16,7 @@ import (
 
 const (
 	// V2binary is the name of the registry v2 binary
-	V2binary = "registry-v2"
-	// V2binarySchema1 is the name of the registry that serve schema1
-	V2binarySchema1 = "registry-v2-schema1"
+	V2binary = "registry"
 	// DefaultURL is the default url that will be used by the registry (if not specified otherwise)
 	DefaultURL = "127.0.0.1:5000"
 )
@@ -36,7 +34,6 @@ type V2 struct {
 
 // Config contains the test registry configuration
 type Config struct {
-	schema1     bool
 	auth        string
 	tokenURL    string
 	registryURL string
@@ -78,7 +75,7 @@ http:
 		username = "testuser"
 		password = "testpassword"
 		email = "test@test.org"
-		err := os.WriteFile(htpasswdPath, []byte(userpasswd), os.FileMode(0644))
+		err := os.WriteFile(htpasswdPath, []byte(userpasswd), os.FileMode(0o644))
 		assert.NilError(t, err)
 		authTemplate = fmt.Sprintf(`auth:
     htpasswd:
@@ -106,11 +103,7 @@ http:
 		t.Fatal(err)
 	}
 
-	binary := V2binary
-	if c.schema1 {
-		binary = V2binarySchema1
-	}
-	cmd := exec.Command(binary, confPath)
+	cmd := exec.Command(V2binary, "serve", confPath)
 	cmd.Stdout = c.stdout
 	cmd.Stderr = c.stderr
 	if err := cmd.Start(); err != nil {
@@ -190,7 +183,7 @@ func (r *V2) ReadBlobContents(t testing.TB, blobDigest digest.Digest) []byte {
 // WriteBlobContents write the file corresponding to the specified digest with the given content
 func (r *V2) WriteBlobContents(t testing.TB, blobDigest digest.Digest, data []byte) {
 	t.Helper()
-	err := os.WriteFile(r.getBlobFilename(blobDigest), data, os.FileMode(0644))
+	err := os.WriteFile(r.getBlobFilename(blobDigest), data, os.FileMode(0o644))
 	assert.NilError(t, err, "unable to write malicious data blob")
 }
 

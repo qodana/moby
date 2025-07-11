@@ -1,4 +1,4 @@
-package syslog // import "github.com/docker/docker/daemon/logger/syslog"
+package syslog
 
 import (
 	"log"
@@ -110,7 +110,6 @@ func TestValidateSyslogAddress(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		if tc.skipOn == runtime.GOOS {
 			continue
 		}

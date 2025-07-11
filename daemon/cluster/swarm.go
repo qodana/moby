@@ -1,4 +1,4 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
-	apitypes "github.com/docker/docker/api/types"
+	"github.com/containerd/log"
+	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	types "github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/daemon/cluster/convert"
@@ -18,7 +20,6 @@ import (
 	"github.com/moby/swarmkit/v2/manager/encryption"
 	swarmnode "github.com/moby/swarmkit/v2/node"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -87,7 +88,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		if !found {
 			ip, err := c.resolveSystemAddr()
 			if err != nil {
-				logrus.Warnf("Could not find a local address: %v", err)
+				log.G(context.TODO()).Warnf("Could not find a local address: %v", err)
 				return "", errMustSpecifyListenAddr
 			}
 			localAddr = ip.String()
@@ -127,7 +128,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		c.nr = nil
 		c.mu.Unlock()
 		if !req.ForceNewCluster { // if failure on first attempt don't keep state
-			if err := clearPersistentState(c.root); err != nil {
+			if err := clearPersistentState(c.stateDir); err != nil {
 				return "", err
 			}
 		}
@@ -206,7 +207,7 @@ func (c *Cluster) Join(req types.JoinRequest) error {
 			c.mu.Lock()
 			c.nr = nil
 			c.mu.Unlock()
-			if err := clearPersistentState(c.root); err != nil {
+			if err := clearPersistentState(c.stateDir); err != nil {
 				return err
 			}
 		}
@@ -313,7 +314,7 @@ func (c *Cluster) UnlockSwarm(req types.UnlockRequest) error {
 	if !state.IsActiveManager() {
 		// when manager is not active,
 		// unless it is locked, otherwise return error.
-		if err := c.errNoManager(state); err != errSwarmLocked {
+		if err := c.errNoManager(state); !errors.Is(err, errSwarmLocked) {
 			c.mu.RUnlock()
 			return err
 		}
@@ -398,7 +399,7 @@ func (c *Cluster) Leave(ctx context.Context, force bool) error {
 	}
 	// release readers in here
 	if err := nr.Stop(); err != nil {
-		logrus.Errorf("failed to shut down cluster node: %v", err)
+		log.G(ctx).Errorf("failed to shut down cluster node: %v", err)
 		stack.Dump()
 		return err
 	}
@@ -413,14 +414,14 @@ func (c *Cluster) Leave(ctx context.Context, force bool) error {
 			return err
 		}
 		for _, id := range nodeContainers {
-			if err := c.config.Backend.ContainerRm(id, &apitypes.ContainerRmConfig{ForceRemove: true}); err != nil {
-				logrus.Errorf("error removing %v: %v", id, err)
+			if err := c.config.Backend.ContainerRm(id, &backend.ContainerRmConfig{ForceRemove: true}); err != nil {
+				log.G(ctx).Errorf("error removing %v: %v", id, err)
 			}
 		}
 	}
 
 	// todo: cleanup optional?
-	if err := clearPersistentState(c.root); err != nil {
+	if err := clearPersistentState(c.stateDir); err != nil {
 		return err
 	}
 	c.config.Backend.DaemonLeavesCluster()
@@ -428,7 +429,7 @@ func (c *Cluster) Leave(ctx context.Context, force bool) error {
 }
 
 // Info returns information about the current cluster state.
-func (c *Cluster) Info() types.Info {
+func (c *Cluster) Info(ctx context.Context) types.Info {
 	info := types.Info{
 		NodeAddr: c.GetAdvertiseAddress(),
 	}
@@ -441,7 +442,7 @@ func (c *Cluster) Info() types.Info {
 		info.Error = state.err.Error()
 	}
 
-	ctx, cancel := c.getRequestContext()
+	ctx, cancel := context.WithTimeout(ctx, swarmRequestTimeout)
 	defer cancel()
 
 	if state.IsActiveManager() {
@@ -606,7 +607,7 @@ func initClusterSpec(node *swarmnode.Node, spec types.Spec) error {
 
 func (c *Cluster) listContainerForNode(ctx context.Context, nodeID string) ([]string, error) {
 	var ids []string
-	containers, err := c.config.Backend.Containers(ctx, &apitypes.ContainerListOptions{
+	containers, err := c.config.Backend.Containers(ctx, &container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", "com.docker.swarm.node.id="+nodeID)),
 	})
 	if err != nil {

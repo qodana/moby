@@ -1,58 +1,71 @@
 //go:build linux
-// +build linux
 
 package overlay
 
-//go:generate protoc -I.:../../Godeps/_workspace/src/github.com/gogo/protobuf  --gogo_out=import_path=github.com/docker/docker/libnetwork/drivers/overlay,Mgogoproto/gogo.proto=github.com/gogo/protobuf/gogoproto:. overlay.proto
+//go:generate protoc -I=. -I=../../../vendor/ --gogofaster_out=import_path=github.com/docker/docker/libnetwork/drivers/overlay:. overlay.proto
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/netip"
 	"sync"
 
-	"github.com/docker/docker/libnetwork/datastore"
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
-	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/libnetwork/scope"
 )
 
 const (
-	networkType  = "overlay"
+	NetworkType  = "overlay"
 	vethPrefix   = "veth"
 	vethLen      = len(vethPrefix) + 7
 	vxlanEncap   = 50
 	secureOption = "encrypted"
 )
 
+// overlay driver must implement the discover-API.
+var _ discoverapi.Discover = (*driver)(nil)
+
 type driver struct {
-	bindAddress      string
-	advertiseAddress string
-	config           map[string]interface{}
-	peerDb           peerNetworkMap
-	secMap           *encrMap
+	// Immutable; mu does not need to be held when accessing these fields.
+
+	config map[string]interface{}
+	initOS sync.Once
+
+	// encrMu guards secMap and keys,
+	// and synchronizes the application of encryption parameters
+	// to the kernel.
+	//
+	// This mutex is above mu in the lock hierarchy.
+	// Do not lock any locks aside from mu while holding encrMu.
+	encrMu sync.Mutex
+	secMap encrMap
+	keys   []*key
+
+	// mu must be held when accessing the fields which follow it
+	// in the struct definition.
+	//
+	// This mutex is at the bottom of the lock hierarchy:
+	// do not lock any other locks while holding it.
+	mu               sync.Mutex
+	bindAddress      netip.Addr
+	advertiseAddress netip.Addr
 	networks         networkTable
-	initOS           sync.Once
-	localJoinOnce    sync.Once
-	keys             []*key
-	peerOpMu         sync.Mutex
-	sync.Mutex
 }
 
 // Register registers a new instance of the overlay driver.
 func Register(r driverapi.Registerer, config map[string]interface{}) error {
-	c := driverapi.Capability{
-		DataScope:         datastore.GlobalScope,
-		ConnectivityScope: datastore.GlobalScope,
-	}
 	d := &driver{
 		networks: networkTable{},
-		peerDb: peerNetworkMap{
-			mp: map[string]*peerMap{},
-		},
-		secMap: &encrMap{nodes: map[string][]*spi{}},
-		config: config,
+		secMap:   encrMap{},
+		config:   config,
 	}
-
-	return r.RegisterDriver(networkType, d, c)
+	return r.RegisterDriver(NetworkType, d, driverapi.Capability{
+		DataScope:         scope.Global,
+		ConnectivityScope: scope.Global,
+	})
 }
 
 func (d *driver) configure() error {
@@ -63,26 +76,38 @@ func (d *driver) configure() error {
 }
 
 func (d *driver) Type() string {
-	return networkType
+	return NetworkType
 }
 
 func (d *driver) IsBuiltIn() bool {
 	return true
 }
 
-func (d *driver) nodeJoin(advertiseAddress, bindAddress string, self bool) {
-	if self {
-		d.Lock()
-		d.advertiseAddress = advertiseAddress
-		d.bindAddress = bindAddress
-		d.Unlock()
-
-		// If containers are already running on this network update the
-		// advertise address in the peerDB
-		d.localJoinOnce.Do(func() {
-			d.peerDBUpdateSelf()
-		})
+// isIPv6Transport reports whether the outer Layer-3 transport for VXLAN datagrams is IPv6.
+func (d *driver) isIPv6Transport() (bool, error) {
+	// Infer whether remote peers' virtual tunnel endpoints will be IPv4 or IPv6
+	// from the address family of our own advertise address. This is a
+	// reasonable inference to make as Linux VXLAN links do not support
+	// mixed-address-family remote peers.
+	if !d.advertiseAddress.IsValid() {
+		return false, errors.New("overlay: cannot determine address family of transport: the local data-plane address is not currently known")
 	}
+	return d.advertiseAddress.Is6(), nil
+}
+
+func (d *driver) nodeJoin(data discoverapi.NodeDiscoveryData) error {
+	if data.Self {
+		advAddr, _ := netip.ParseAddr(data.Address)
+		bindAddr, _ := netip.ParseAddr(data.BindAddress)
+		if !advAddr.IsValid() {
+			return errors.New("invalid discovery data")
+		}
+		d.mu.Lock()
+		d.advertiseAddress = advAddr
+		d.bindAddress = bindAddr
+		d.mu.Unlock()
+	}
+	return nil
 }
 
 // DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster
@@ -90,14 +115,14 @@ func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) 
 	switch dType {
 	case discoverapi.NodeDiscovery:
 		nodeData, ok := data.(discoverapi.NodeDiscoveryData)
-		if !ok || nodeData.Address == "" {
-			return fmt.Errorf("invalid discovery data")
+		if !ok {
+			return fmt.Errorf("invalid discovery data type: %T", data)
 		}
-		d.nodeJoin(nodeData.Address, nodeData.BindAddress, nodeData.Self)
+		return d.nodeJoin(nodeData)
 	case discoverapi.EncryptionKeysConfig:
 		encrData, ok := data.(discoverapi.DriverEncryptionConfig)
 		if !ok {
-			return fmt.Errorf("invalid encryption key notification data")
+			return errors.New("invalid encryption key notification data")
 		}
 		keys := make([]*key, 0, len(encrData.Keys))
 		for i := 0; i < len(encrData.Keys); i++ {
@@ -108,13 +133,13 @@ func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) 
 			keys = append(keys, k)
 		}
 		if err := d.setKeys(keys); err != nil {
-			logrus.Warn(err)
+			log.G(context.TODO()).Warn(err)
 		}
 	case discoverapi.EncryptionKeysUpdate:
 		var newKey, delKey, priKey *key
 		encrData, ok := data.(discoverapi.DriverEncryptionUpdate)
 		if !ok {
-			return fmt.Errorf("invalid encryption key notification data")
+			return errors.New("invalid encryption key notification data")
 		}
 		if encrData.Key != nil {
 			newKey = &key{

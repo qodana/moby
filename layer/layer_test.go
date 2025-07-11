@@ -1,4 +1,4 @@
-package layer // import "github.com/docker/docker/layer"
+package layer
 
 import (
 	"bytes"
@@ -13,9 +13,9 @@ import (
 	"github.com/containerd/continuity/driver"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/daemon/graphdriver/vfs"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/go-archive"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -26,58 +26,47 @@ func init() {
 }
 
 func newVFSGraphDriver(td string) (graphdriver.Driver, error) {
-	uidMap := []idtools.IDMap{
-		{
-			ContainerID: 0,
-			HostID:      os.Getuid(),
-			Size:        1,
+	return graphdriver.New("vfs", graphdriver.Options{
+		Root: td,
+		IDMap: user.IdentityMapping{
+			UIDMaps: []user.IDMap{{
+				ID:       0,
+				ParentID: int64(os.Getuid()),
+				Count:    1,
+			}},
+			GIDMaps: []user.IDMap{{
+				ID:       0,
+				ParentID: int64(os.Getgid()),
+				Count:    1,
+			}},
 		},
-	}
-	gidMap := []idtools.IDMap{
-		{
-			ContainerID: 0,
-			HostID:      os.Getgid(),
-			Size:        1,
-		},
-	}
-
-	options := graphdriver.Options{Root: td, IDMap: idtools.IdentityMapping{UIDMaps: uidMap, GIDMaps: gidMap}}
-	return graphdriver.GetDriver("vfs", nil, options)
+	})
 }
 
-func newTestGraphDriver(t *testing.T) (graphdriver.Driver, func()) {
-	td, err := os.MkdirTemp("", "graph-")
+func newTestGraphDriver(t *testing.T) graphdriver.Driver {
+	t.Helper()
+	td := t.TempDir()
+
+	graphDriver, err := newVFSGraphDriver(td)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	driver, err := newVFSGraphDriver(td)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return driver, func() {
-		os.RemoveAll(td)
-	}
+	return graphDriver
 }
 
-func newTestStore(t *testing.T) (Store, string, func()) {
-	td, err := os.MkdirTemp("", "layerstore-")
-	if err != nil {
-		t.Fatal(err)
-	}
+func newTestStore(t *testing.T) (Store, string) {
+	t.Helper()
+	td := t.TempDir()
 
-	graph, graphcleanup := newTestGraphDriver(t)
+	graph := newTestGraphDriver(t)
 
 	ls, err := newStoreFromGraphDriver(td, graph)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return ls, td, func() {
-		graphcleanup()
-		os.RemoveAll(td)
-	}
+	return ls, td
 }
 
 type layerInit func(root string) error
@@ -245,8 +234,7 @@ func assertLayerEqual(t *testing.T, l1, l2 Layer) {
 }
 
 func TestMountAndRegister(t *testing.T) {
-	ls, _, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, _ := newTestStore(t)
 
 	li := initWithFiles(newTestFile("testfile.txt", []byte("some test data"), 0o644))
 	layer, err := createLayer(ls, "", li)
@@ -290,8 +278,7 @@ func TestLayerRelease(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Failing on Windows")
 	}
-	ls, _, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, _ := newTestStore(t)
 
 	layer1, err := createLayer(ls, "", initWithFiles(newTestFile("layer1.txt", []byte("layer 1 file"), 0o644)))
 	if err != nil {
@@ -339,8 +326,7 @@ func TestStoreRestore(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Failing on Windows")
 	}
-	ls, _, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, _ := newTestStore(t)
 
 	layer1, err := createLayer(ls, "", initWithFiles(newTestFile("layer1.txt", []byte("layer 1 file"), 0o644)))
 	if err != nil {
@@ -454,8 +440,7 @@ func TestTarStreamStability(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Failing on Windows")
 	}
-	ls, _, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, _ := newTestStore(t)
 
 	files1 := []FileApplier{
 		newTestFile("/etc/hosts", []byte("mydomain 10.0.0.1"), 0o644),
@@ -532,7 +517,7 @@ func TestTarStreamStability(t *testing.T) {
 func assertLayerDiff(t *testing.T, expected []byte, layer Layer) {
 	expectedDigest := digest.FromBytes(expected)
 
-	if digest.Digest(layer.DiffID()) != expectedDigest {
+	if layer.DiffID() != expectedDigest {
 		t.Fatalf("Mismatched diff id for %s, got %s, expected %s", layer.ChainID(), layer.DiffID(), expected)
 	}
 
@@ -618,6 +603,7 @@ func tarFromFiles(files ...FileApplier) ([]byte, error) {
 // assertReferences asserts that all the references are to the same
 // image and represent the full set of references to that image.
 func assertReferences(t *testing.T, references ...Layer) {
+	t.Helper()
 	if len(references) == 0 {
 		return
 	}
@@ -643,8 +629,7 @@ func assertReferences(t *testing.T, references ...Layer) {
 }
 
 func TestRegisterExistingLayer(t *testing.T) {
-	ls, _, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, _ := newTestStore(t)
 
 	baseFiles := []FileApplier{
 		newTestFile("/etc/profile", []byte("# Base configuration"), 0o644),
@@ -683,8 +668,7 @@ func TestTarStreamVerification(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Failing on Windows")
 	}
-	ls, tmpdir, cleanup := newTestStore(t)
-	defer cleanup()
+	ls, tmpdir := newTestStore(t)
 
 	files1 := []FileApplier{
 		newTestFile("/foo", []byte("abc"), 0o644),
@@ -714,8 +698,8 @@ func TestTarStreamVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id1 := digest.Digest(layer1.ChainID())
-	id2 := digest.Digest(layer2.ChainID())
+	id1 := layer1.ChainID()
+	id2 := layer2.ChainID()
 
 	// Replace tar data files
 	src, err := os.Open(filepath.Join(tmpdir, id1.Algorithm().String(), id1.Encoded(), "tar-split.json.gz"))

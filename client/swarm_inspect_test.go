@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestSwarmInspectError(t *testing.T) {
@@ -20,9 +22,7 @@ func TestSwarmInspectError(t *testing.T) {
 	}
 
 	_, err := client.SwarmInspect(context.Background())
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestSwarmInspect(t *testing.T) {
@@ -48,10 +48,6 @@ func TestSwarmInspect(t *testing.T) {
 	}
 
 	swarmInspect, err := client.SwarmInspect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if swarmInspect.ID != "swarm_id" {
-		t.Fatalf("expected `swarm_id`, got %s", swarmInspect.ID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(swarmInspect.ID, "swarm_id"))
 }

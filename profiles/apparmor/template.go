@@ -1,7 +1,6 @@
 //go:build linux
-// +build linux
 
-package apparmor // import "github.com/docker/docker/profiles/apparmor"
+package apparmor
 
 // NOTE: This profile is replicated in containerd and libpod. If you make a
 //       change to this profile, please make follow-up PRs to those projects so
@@ -26,6 +25,10 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   umount,
   # Host (privileged) processes may send signals to container processes.
   signal (receive) peer=unconfined,
+  # runc may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  # crun may send signals to container processes (for "docker stop" when used with crun OCI runtime).
+  signal (receive) peer=crun,
   # dockerd may send signals to container processes (for "docker kill").
   signal (receive) peer={{.DaemonProfile}},
   # Container processes may send signals amongst themselves.
@@ -47,6 +50,7 @@ profile {{.Name}} flags=(attach_disconnected,mediate_deleted) {
   deny /sys/fs/c[^g]*/** wklx,
   deny /sys/fs/cg[^r]*/** wklx,
   deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
   # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container

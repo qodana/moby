@@ -1,17 +1,16 @@
-package drivers // import "github.com/docker/docker/volume/drivers"
+package drivers
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/volume"
-	"github.com/sirupsen/logrus"
 )
 
-var (
-	errNoSuchVolume = errors.New("no such volume")
-)
+var errNoSuchVolume = errors.New("no such volume")
 
 type volumeDriverAdapter struct {
 	name         string
@@ -82,35 +81,35 @@ func (a *volumeDriverAdapter) Get(name string) (volume.Volume, error) {
 }
 
 func (a *volumeDriverAdapter) Scope() string {
-	cap := a.getCapabilities()
-	return cap.Scope
+	capabilities := a.getCapabilities()
+	return capabilities.Scope
 }
 
 func (a *volumeDriverAdapter) getCapabilities() volume.Capability {
 	if a.capabilities != nil {
 		return *a.capabilities
 	}
-	cap, err := a.proxy.Capabilities()
+	capabilities, err := a.proxy.Capabilities()
 	if err != nil {
 		// `GetCapabilities` is a not a required endpoint.
 		// On error assume it's a local-only driver
-		logrus.WithError(err).WithField("driver", a.name).Debug("Volume driver returned an error while trying to query its capabilities, using default capabilities")
+		log.G(context.TODO()).WithError(err).WithField("driver", a.name).Debug("Volume driver returned an error while trying to query its capabilities, using default capabilities")
 		return volume.Capability{Scope: volume.LocalScope}
 	}
 
 	// don't spam the warn log below just because the plugin didn't provide a scope
-	if len(cap.Scope) == 0 {
-		cap.Scope = volume.LocalScope
+	if capabilities.Scope == "" {
+		capabilities.Scope = volume.LocalScope
 	}
 
-	cap.Scope = strings.ToLower(cap.Scope)
-	if cap.Scope != volume.LocalScope && cap.Scope != volume.GlobalScope {
-		logrus.WithField("driver", a.Name()).WithField("scope", a.Scope).Warn("Volume driver returned an invalid scope")
-		cap.Scope = volume.LocalScope
+	capabilities.Scope = strings.ToLower(capabilities.Scope)
+	if capabilities.Scope != volume.LocalScope && capabilities.Scope != volume.GlobalScope {
+		log.G(context.TODO()).WithField("driver", a.Name()).WithField("scope", a.Scope).Warn("Volume driver returned an invalid scope")
+		capabilities.Scope = volume.LocalScope
 	}
 
-	a.capabilities = &cap
-	return cap
+	a.capabilities = &capabilities
+	return capabilities
 }
 
 type volumeAdapter struct {
@@ -139,7 +138,7 @@ func (a *volumeAdapter) DriverName() string {
 }
 
 func (a *volumeAdapter) Path() string {
-	if len(a.eMount) == 0 {
+	if a.eMount == "" {
 		mountpoint, _ := a.proxy.Path(a.name)
 		a.eMount = a.scopePath(mountpoint)
 	}
@@ -167,6 +166,7 @@ func (a *volumeAdapter) Unmount(id string) error {
 func (a *volumeAdapter) CreatedAt() (time.Time, error) {
 	return a.createdAt, nil
 }
+
 func (a *volumeAdapter) Status() map[string]interface{} {
 	out := make(map[string]interface{}, len(a.status))
 	for k, v := range a.status {

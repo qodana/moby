@@ -1,12 +1,13 @@
 //go:build !windows
-// +build !windows
 
 package libnetwork
 
 import (
+	"context"
 	"fmt"
 	"net"
 
+	"github.com/docker/docker/libnetwork/internal/nftables"
 	"github.com/docker/docker/libnetwork/iptables"
 )
 
@@ -17,7 +18,7 @@ const (
 	postroutingChain = "DOCKER_POSTROUTING"
 )
 
-func (r *Resolver) setupIPTable() error {
+func (r *Resolver) setupNAT(ctx context.Context) error {
 	if r.err != nil {
 		return r.err
 	}
@@ -25,6 +26,14 @@ func (r *Resolver) setupIPTable() error {
 	ltcpaddr := r.tcpListen.Addr().String()
 	resolverIP, ipPort, _ := net.SplitHostPort(laddr)
 	_, tcpPort, _ := net.SplitHostPort(ltcpaddr)
+
+	if nftables.Enabled() {
+		return r.setupNftablesNAT(ctx, laddr, ltcpaddr, resolverIP, ipPort, tcpPort)
+	}
+	return r.setupIptablesNAT(laddr, ltcpaddr, resolverIP, ipPort, tcpPort)
+}
+
+func (r *Resolver) setupIptablesNAT(laddr, ltcpaddr, resolverIP, ipPort, tcpPort string) error {
 	rules := [][]string{
 		{"-t", "nat", "-I", outputChain, "-d", resolverIP, "-p", "udp", "--dport", dnsPort, "-j", "DNAT", "--to-destination", laddr},
 		{"-t", "nat", "-I", postroutingChain, "-s", resolverIP, "-p", "udp", "--sport", ipPort, "-j", "SNAT", "--to-source", ":" + dnsPort},
@@ -38,8 +47,7 @@ func (r *Resolver) setupIPTable() error {
 		iptable := iptables.GetIptable(iptables.IPv4)
 
 		// insert outputChain and postroutingchain
-		err := iptable.RawCombinedOutputNative("-t", "nat", "-C", "OUTPUT", "-d", resolverIP, "-j", outputChain)
-		if err == nil {
+		if iptable.ExistsNative("nat", "OUTPUT", "-d", resolverIP, "-j", outputChain) {
 			if err := iptable.RawCombinedOutputNative("-t", "nat", "-F", outputChain); err != nil {
 				setupErr = err
 				return
@@ -55,8 +63,7 @@ func (r *Resolver) setupIPTable() error {
 			}
 		}
 
-		err = iptable.RawCombinedOutputNative("-t", "nat", "-C", "POSTROUTING", "-d", resolverIP, "-j", postroutingChain)
-		if err == nil {
+		if iptable.ExistsNative("nat", "POSTROUTING", "-d", resolverIP, "-j", postroutingChain) {
 			if err := iptable.RawCombinedOutputNative("-t", "nat", "-F", postroutingChain); err != nil {
 				setupErr = err
 				return
@@ -80,6 +87,43 @@ func (r *Resolver) setupIPTable() error {
 		}
 	})
 	if err != nil {
+		return err
+	}
+	return setupErr
+}
+
+func (r *Resolver) setupNftablesNAT(ctx context.Context, laddr, ltcpaddr, resolverIP, ipPort, tcpPort string) error {
+	table, err := nftables.NewTable(nftables.IPv4, "docker-dns")
+	if err != nil {
+		return err
+	}
+
+	dnatChain, err := table.BaseChain(ctx, "dns-dnat", nftables.BaseChainTypeNAT, nftables.BaseChainHookOutput, nftables.BaseChainPriorityDstNAT)
+	if err != nil {
+		return err
+	}
+	if err := dnatChain.AppendRule(ctx, 0, "ip daddr %s udp dport %s counter dnat to %s", resolverIP, dnsPort, laddr); err != nil {
+		return err
+	}
+	if err := dnatChain.AppendRule(ctx, 0, "ip daddr %s tcp dport %s counter dnat to %s", resolverIP, dnsPort, ltcpaddr); err != nil {
+		return err
+	}
+
+	snatChain, err := table.BaseChain(ctx, "dns-snat", nftables.BaseChainTypeNAT, nftables.BaseChainHookPostrouting, nftables.BaseChainPrioritySrcNAT)
+	if err != nil {
+		return err
+	}
+	if err := snatChain.AppendRule(ctx, 0, "ip saddr %s udp sport %s counter snat to :%s", resolverIP, ipPort, dnsPort); err != nil {
+		return err
+	}
+	if err := snatChain.AppendRule(ctx, 0, "ip saddr %s tcp sport %s counter snat to :%s", resolverIP, tcpPort, dnsPort); err != nil {
+		return err
+	}
+
+	var setupErr error
+	if err := r.backend.ExecFunc(func() {
+		setupErr = table.Apply(ctx)
+	}); err != nil {
 		return err
 	}
 	return setupErr

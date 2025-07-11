@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,9 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestPluginListError(t *testing.T) {
@@ -21,9 +23,7 @@ func TestPluginListError(t *testing.T) {
 	}
 
 	_, err := client.PluginList(context.Background(), filters.NewArgs())
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestPluginList(t *testing.T) {
@@ -94,11 +94,7 @@ func TestPluginList(t *testing.T) {
 		}
 
 		plugins, err := client.PluginList(context.Background(), listCase.filters)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(plugins) != 2 {
-			t.Fatalf("expected 2 plugins, got %v", plugins)
-		}
+		assert.NilError(t, err)
+		assert.Check(t, is.Len(plugins, 2))
 	}
 }

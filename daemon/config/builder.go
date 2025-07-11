@@ -6,13 +6,42 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/filters"
+	bkconfig "github.com/moby/buildkit/cmd/buildkitd/config"
 )
 
 // BuilderGCRule represents a GC rule for buildkit cache
 type BuilderGCRule struct {
-	All         bool            `json:",omitempty"`
-	Filter      BuilderGCFilter `json:",omitempty"`
-	KeepStorage string          `json:",omitempty"`
+	All           bool            `json:",omitempty"`
+	Filter        BuilderGCFilter `json:",omitempty"`
+	ReservedSpace string          `json:",omitempty"`
+	MaxUsedSpace  string          `json:",omitempty"`
+	MinFreeSpace  string          `json:",omitempty"`
+}
+
+func (x *BuilderGCRule) UnmarshalJSON(data []byte) error {
+	var xx struct {
+		All           bool            `json:",omitempty"`
+		Filter        BuilderGCFilter `json:",omitempty"`
+		ReservedSpace string          `json:",omitempty"`
+		MaxUsedSpace  string          `json:",omitempty"`
+		MinFreeSpace  string          `json:",omitempty"`
+
+		// Deprecated option is now equivalent to ReservedSpace.
+		KeepStorage string `json:",omitempty"`
+	}
+	if err := json.Unmarshal(data, &xx); err != nil {
+		return err
+	}
+
+	x.All = xx.All
+	x.Filter = xx.Filter
+	x.ReservedSpace = xx.ReservedSpace
+	x.MaxUsedSpace = xx.MaxUsedSpace
+	x.MinFreeSpace = xx.MinFreeSpace
+	if x.ReservedSpace == "" {
+		x.ReservedSpace = xx.KeepStorage
+	}
+	return nil
 }
 
 // BuilderGCFilter contains garbage-collection filter rules for a BuildKit builder
@@ -55,15 +84,51 @@ func (x *BuilderGCFilter) UnmarshalJSON(data []byte) error {
 
 // BuilderGCConfig contains GC config for a buildkit builder
 type BuilderGCConfig struct {
-	Enabled            bool            `json:",omitempty"`
-	Policy             []BuilderGCRule `json:",omitempty"`
-	DefaultKeepStorage string          `json:",omitempty"`
+	Enabled              *bool           `json:",omitempty"`
+	Policy               []BuilderGCRule `json:",omitempty"`
+	DefaultReservedSpace string          `json:",omitempty"`
+	DefaultMaxUsedSpace  string          `json:",omitempty"`
+	DefaultMinFreeSpace  string          `json:",omitempty"`
+}
+
+func (x *BuilderGCConfig) IsEnabled() bool {
+	return x.Enabled == nil || *x.Enabled
+}
+
+func (x *BuilderGCConfig) UnmarshalJSON(data []byte) error {
+	var xx struct {
+		Enabled              bool            `json:",omitempty"`
+		Policy               []BuilderGCRule `json:",omitempty"`
+		DefaultReservedSpace string          `json:",omitempty"`
+		DefaultMaxUsedSpace  string          `json:",omitempty"`
+		DefaultMinFreeSpace  string          `json:",omitempty"`
+
+		// Deprecated option is now equivalent to DefaultReservedSpace.
+		DefaultKeepStorage string `json:",omitempty"`
+	}
+
+	// Set defaults.
+	xx.Enabled = true
+
+	if err := json.Unmarshal(data, &xx); err != nil {
+		return err
+	}
+
+	x.Enabled = &xx.Enabled
+	x.Policy = xx.Policy
+	x.DefaultReservedSpace = xx.DefaultReservedSpace
+	x.DefaultMaxUsedSpace = xx.DefaultMaxUsedSpace
+	x.DefaultMinFreeSpace = xx.DefaultMinFreeSpace
+	if x.DefaultReservedSpace == "" {
+		x.DefaultReservedSpace = xx.DefaultKeepStorage
+	}
+	return nil
 }
 
 // BuilderHistoryConfig contains history config for a buildkit builder
 type BuilderHistoryConfig struct {
-	MaxAge     int64 `json:",omitempty"`
-	MaxEntries int64 `json:",omitempty"`
+	MaxAge     bkconfig.Duration `json:",omitempty"`
+	MaxEntries int64             `json:",omitempty"`
 }
 
 // BuilderEntitlements contains settings to enable/disable entitlements

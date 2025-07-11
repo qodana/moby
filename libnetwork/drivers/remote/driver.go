@@ -1,39 +1,56 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.23
+
 package remote
 
 import (
+	"context"
 	"fmt"
+	"maps"
 	"net"
+	"sync"
 
-	"github.com/docker/docker/libnetwork/datastore"
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/drivers/remote/api"
+	"github.com/docker/docker/libnetwork/netlabel"
+	"github.com/docker/docker/libnetwork/options"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
+// remote driver must implement the discover-API.
+var _ discoverapi.Discover = (*driver)(nil)
+
 type driver struct {
-	endpoint    *plugins.Client
-	networkType string
+	endpoint       *plugins.Client
+	networkType    string
+	gwAllocChecker bool
+	nwEndpoints    map[string]*nwEndpoint // Set of endpoint ids that are currently acting as container gateways.
+	nwEndpointsMu  sync.Mutex
+}
+
+// State info for an endpoint.
+type nwEndpoint struct {
+	sbOptions  map[string]any // Sandbox (container) options, from Join.
+	isGateway4 bool           // Whether ProgramExternalConnectivity reported that this ep is a gateway.
+	isGateway6 bool
 }
 
 type maybeError interface {
 	GetError() string
 }
 
-func newDriver(name string, client *plugins.Client) driverapi.Driver {
-	return &driver{networkType: name, endpoint: client}
-}
-
-// Init makes sure a remote driver is registered when a network driver
-// plugin is activated.
-//
-// Deprecated: use [Register].
-func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	return Register(dc, dc.GetPluginGetter())
+func newDriver(name string, client *plugins.Client) *driver {
+	return &driver{
+		networkType: name,
+		endpoint:    client,
+		nwEndpoints: make(map[string]*nwEndpoint),
+	}
 }
 
 // Register makes sure a remote driver is registered with r when a network
@@ -42,13 +59,13 @@ func Register(r driverapi.Registerer, pg plugingetter.PluginGetter) error {
 	newPluginHandler := func(name string, client *plugins.Client) {
 		// negotiate driver capability with client
 		d := newDriver(name, client)
-		c, err := d.(*driver).getCapabilities()
+		c, err := d.getCapabilities()
 		if err != nil {
-			logrus.Errorf("error getting capability for %s due to %v", name, err)
+			log.G(context.TODO()).Errorf("error getting capability for %s due to %v", name, err)
 			return
 		}
 		if err = r.RegisterDriver(name, d, *c); err != nil {
-			logrus.Errorf("error registering driver for %s due to %v", name, err)
+			log.G(context.TODO()).Errorf("error registering driver for %s due to %v", name, err)
 		}
 	}
 
@@ -101,24 +118,22 @@ func (d *driver) getCapabilities() (*driverapi.Capability, error) {
 
 	c := &driverapi.Capability{}
 	switch capResp.Scope {
-	case "global":
-		c.DataScope = datastore.GlobalScope
-	case "local":
-		c.DataScope = datastore.LocalScope
+	case scope.Global, scope.Local:
+		c.DataScope = capResp.Scope
 	default:
 		return nil, fmt.Errorf("invalid capability: expecting 'local' or 'global', got %s", capResp.Scope)
 	}
 
 	switch capResp.ConnectivityScope {
-	case "global":
-		c.ConnectivityScope = datastore.GlobalScope
-	case "local":
-		c.ConnectivityScope = datastore.LocalScope
+	case scope.Global, scope.Local:
+		c.ConnectivityScope = capResp.ConnectivityScope
 	case "":
 		c.ConnectivityScope = c.DataScope
 	default:
 		return nil, fmt.Errorf("invalid capability: expecting 'local' or 'global', got %s", capResp.Scope)
 	}
+
+	d.gwAllocChecker = capResp.GwAllocChecker
 
 	return c, nil
 }
@@ -166,7 +181,7 @@ func (d *driver) DecodeTableEntry(tablename string, key string, value []byte) (s
 	return "", nil
 }
 
-func (d *driver) CreateNetwork(id string, options map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
+func (d *driver) CreateNetwork(ctx context.Context, id string, options map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	create := &api.CreateNetworkRequest{
 		NetworkID: id,
 		Options:   options,
@@ -176,12 +191,22 @@ func (d *driver) CreateNetwork(id string, options map[string]interface{}, nInfo 
 	return d.call("CreateNetwork", create, &api.CreateNetworkResponse{})
 }
 
-func (d *driver) DeleteNetwork(nid string) error {
-	delete := &api.DeleteNetworkRequest{NetworkID: nid}
-	return d.call("DeleteNetwork", delete, &api.DeleteNetworkResponse{})
+func (d *driver) GetSkipGwAlloc(opts options.Generic) (ipv4, ipv6 bool, _ error) {
+	if !d.gwAllocChecker {
+		return false, false, nil
+	}
+	resp := &api.GwAllocCheckerResponse{}
+	if err := d.call("GwAllocCheck", &api.GwAllocCheckerRequest{Options: opts}, resp); err != nil {
+		return false, false, err
+	}
+	return resp.SkipIPv4, resp.SkipIPv6, nil
 }
 
-func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
+func (d *driver) DeleteNetwork(nid string) error {
+	return d.call("DeleteNetwork", &api.DeleteNetworkRequest{NetworkID: nid}, &api.DeleteNetworkResponse{})
+}
+
+func (d *driver) CreateEndpoint(_ context.Context, nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) (retErr error) {
 	if ifInfo == nil {
 		return errors.New("must not be called with nil InterfaceInfo")
 	}
@@ -208,6 +233,16 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 		return err
 	}
 
+	defer func() {
+		if retErr != nil {
+			if err := d.DeleteEndpoint(nid, eid); err != nil {
+				retErr = fmt.Errorf("%w; failed to roll back: %w", err, retErr)
+			} else {
+				retErr = fmt.Errorf("%w; rolled back", retErr)
+			}
+		}
+	}()
+
 	inIface, err := parseInterface(res)
 	if err != nil {
 		return err
@@ -219,37 +254,29 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 
 	if inIface.MacAddress != nil {
 		if err := ifInfo.SetMacAddress(inIface.MacAddress); err != nil {
-			return errorWithRollback(fmt.Sprintf("driver modified interface MAC address: %v", err), d.DeleteEndpoint(nid, eid))
+			return fmt.Errorf("driver modified interface MAC address: %v", err)
 		}
 	}
 	if inIface.Address != nil {
 		if err := ifInfo.SetIPAddress(inIface.Address); err != nil {
-			return errorWithRollback(fmt.Sprintf("driver modified interface address: %v", err), d.DeleteEndpoint(nid, eid))
+			return fmt.Errorf("driver modified interface address: %v", err)
 		}
 	}
 	if inIface.AddressIPv6 != nil {
 		if err := ifInfo.SetIPAddress(inIface.AddressIPv6); err != nil {
-			return errorWithRollback(fmt.Sprintf("driver modified interface address: %v", err), d.DeleteEndpoint(nid, eid))
+			return fmt.Errorf("driver modified interface address: %v", err)
 		}
 	}
 
 	return nil
 }
 
-func errorWithRollback(msg string, err error) error {
-	rollback := "rolled back"
-	if err != nil {
-		rollback = "failed to roll back: " + err.Error()
-	}
-	return fmt.Errorf("%s; %s", msg, rollback)
-}
-
 func (d *driver) DeleteEndpoint(nid, eid string) error {
-	delete := &api.DeleteEndpointRequest{
+	deleteRequest := &api.DeleteEndpointRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
 	}
-	return d.call("DeleteEndpoint", delete, &api.DeleteEndpointResponse{})
+	return d.call("DeleteEndpoint", deleteRequest, &api.DeleteEndpointResponse{})
 }
 
 func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, error) {
@@ -265,7 +292,7 @@ func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, erro
 }
 
 // Join method is invoked when a Sandbox is attached to an endpoint.
-func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, options map[string]interface{}) error {
+func (d *driver) Join(_ context.Context, nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, _, options map[string]interface{}) (retErr error) {
 	join := &api.JoinRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
@@ -280,10 +307,20 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 		return err
 	}
 
+	defer func() {
+		if retErr != nil {
+			if err := d.Leave(nid, eid); err != nil {
+				retErr = fmt.Errorf("%w; failed to roll back: %w", err, retErr)
+			} else {
+				retErr = fmt.Errorf("%w; rolled back", retErr)
+			}
+		}
+	}()
+
 	ifaceName := res.InterfaceName
 	if iface := jinfo.InterfaceName(); iface != nil && ifaceName != nil {
-		if err := iface.SetNames(ifaceName.SrcName, ifaceName.DstPrefix); err != nil {
-			return errorWithRollback(fmt.Sprintf("failed to set interface name: %s", err), d.Leave(nid, eid))
+		if err := iface.SetNames(ifaceName.SrcName, ifaceName.DstPrefix, ""); err != nil {
+			return fmt.Errorf("failed to set interface name: %s", err)
 		}
 	}
 
@@ -293,7 +330,7 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 			return fmt.Errorf(`unable to parse Gateway "%s"`, res.Gateway)
 		}
 		if jinfo.SetGateway(addr) != nil {
-			return errorWithRollback(fmt.Sprintf("failed to set gateway: %v", addr), d.Leave(nid, eid))
+			return fmt.Errorf("failed to set gateway: %v", addr)
 		}
 	}
 	if res.GatewayIPv6 != "" {
@@ -301,7 +338,7 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 			return fmt.Errorf(`unable to parse GatewayIPv6 "%s"`, res.GatewayIPv6)
 		}
 		if jinfo.SetGatewayIPv6(addr) != nil {
-			return errorWithRollback(fmt.Sprintf("failed to set gateway IPv6: %v", addr), d.Leave(nid, eid))
+			return fmt.Errorf("failed to set gateway IPv6: %v", addr)
 		}
 	}
 	if len(res.StaticRoutes) > 0 {
@@ -311,13 +348,17 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 		}
 		for _, route := range routes {
 			if jinfo.AddStaticRoute(route.Destination, route.RouteType, route.NextHop) != nil {
-				return errorWithRollback(fmt.Sprintf("failed to set static route: %v", route), d.Leave(nid, eid))
+				return fmt.Errorf("failed to set static route: %v", route)
 			}
 		}
 	}
 	if res.DisableGatewayService {
 		jinfo.DisableGatewayService()
 	}
+
+	d.nwEndpointsMu.Lock()
+	defer d.nwEndpointsMu.Unlock()
+	d.nwEndpoints[eid] = &nwEndpoint{sbOptions: options}
 	return nil
 }
 
@@ -327,11 +368,43 @@ func (d *driver) Leave(nid, eid string) error {
 		NetworkID:  nid,
 		EndpointID: eid,
 	}
-	return d.call("Leave", leave, &api.LeaveResponse{})
+	if err := d.call("Leave", leave, &api.LeaveResponse{}); err != nil {
+		return err
+	}
+	d.nwEndpointsMu.Lock()
+	defer d.nwEndpointsMu.Unlock()
+	delete(d.nwEndpoints, eid)
+	return nil
 }
 
 // ProgramExternalConnectivity is invoked to program the rules to allow external connectivity for the endpoint.
-func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
+func (d *driver) ProgramExternalConnectivity(_ context.Context, nid, eid string, gw4Id, gw6Id string) error {
+	d.nwEndpointsMu.Lock()
+	ep, ok := d.nwEndpoints[eid]
+	d.nwEndpointsMu.Unlock()
+	if !ok {
+		return fmt.Errorf("remote network driver: endpoint %s not found", eid)
+	}
+	isGw4, isGw6 := gw4Id == eid, gw6Id == eid
+	if ep.isGateway4 == isGw4 && ep.isGateway6 == isGw6 {
+		return nil
+	}
+	if !isGw4 && !isGw6 {
+		return d.revokeExternalConnectivity(nid, eid)
+	}
+	ep.isGateway4, ep.isGateway6 = isGw4, isGw6
+	options := ep.sbOptions
+	if !isGw6 && gw6Id != "" {
+		// If there is an IPv6 gateway, but it's not eid, set NoProxy6To4. This label was
+		// used to tell the bridge driver not to try to use the userland proxy for dual
+		// stack port mappings between host IPv6 and container IPv4 (because a different
+		// endpoint may be dealing with IPv6 host addresses). It was undocumented for the
+		// remote driver, marked as being for internal use and subject to later removal.
+		// But, preserve it here for now as there's no other way for a remote driver to
+		// know it shouldn't try to deal with IPv6 in this case.
+		options = maps.Clone(ep.sbOptions)
+		options[netlabel.NoProxy6To4] = true
+	}
 	data := &api.ProgramExternalConnectivityRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
@@ -345,12 +418,18 @@ func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string
 	return err
 }
 
-// RevokeExternalConnectivity method is invoked to remove any external connectivity programming related to the endpoint.
-func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
+// revokeExternalConnectivity method is invoked to remove any external connectivity programming related to the endpoint.
+func (d *driver) revokeExternalConnectivity(nid, eid string) error {
+	ep, ok := d.nwEndpoints[eid]
+	d.nwEndpointsMu.Unlock()
+	if !ok {
+		return fmt.Errorf("remote network driver: endpoint %s not found", eid)
+	}
 	data := &api.RevokeExternalConnectivityRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
 	}
+	ep.isGateway4, ep.isGateway6 = false, false
 	err := d.call("RevokeExternalConnectivity", data, &api.RevokeExternalConnectivityResponse{})
 	if err != nil && plugins.IsNotFound(err) {
 		// It is not mandatory yet to support this method
@@ -392,7 +471,7 @@ func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{
 }
 
 func parseStaticRoutes(r api.JoinResponse) ([]*types.StaticRoute, error) {
-	var routes = make([]*types.StaticRoute, len(r.StaticRoutes))
+	routes := make([]*types.StaticRoute, len(r.StaticRoutes))
 	for i, inRoute := range r.StaticRoutes {
 		var err error
 		outRoute := &types.StaticRoute{RouteType: inRoute.RouteType}
@@ -415,7 +494,7 @@ func parseStaticRoutes(r api.JoinResponse) ([]*types.StaticRoute, error) {
 	return routes, nil
 }
 
-// parseInterfaces validates all the parameters of an Interface and returns them.
+// parseInterface validates all the parameters of an Interface and returns them.
 func parseInterface(r api.CreateEndpointResponse) (*api.Interface, error) {
 	var outIf *api.Interface
 

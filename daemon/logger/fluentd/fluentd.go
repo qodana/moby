@@ -1,21 +1,22 @@
 // Package fluentd provides the log driver for forwarding server logs
 // to fluentd endpoints.
-package fluentd // import "github.com/docker/docker/daemon/logger/fluentd"
+package fluentd
 
 import (
+	"context"
 	"math"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
 	"github.com/docker/docker/errdefs"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
 	"github.com/fluent/fluent-logger-golang/fluent"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type fluentd struct {
@@ -51,13 +52,17 @@ const (
 
 	addressKey                = "fluentd-address"
 	asyncKey                  = "fluentd-async"
-	asyncConnectKey           = "fluentd-async-connect" // deprecated option (use fluent-async instead)
 	asyncReconnectIntervalKey = "fluentd-async-reconnect-interval"
 	bufferLimitKey            = "fluentd-buffer-limit"
 	maxRetriesKey             = "fluentd-max-retries"
 	requestAckKey             = "fluentd-request-ack"
 	retryWaitKey              = "fluentd-retry-wait"
 	subSecondPrecisionKey     = "fluentd-sub-second-precision"
+	// writeTimeoutKey can be used to specify the WriteTimeout config for fluentd.
+	// Ref: https://github.com/fluent/fluent-logger-golang/blob/5538e904aeb515c10a624da620581bdf420d4b8a/fluent/fluent.go#L55
+	// This allows fluentd to give up unhealthy connections and not be blocked forever
+	// when downstream connections get unhealthy.
+	writeTimeoutKey = "fluentd-write-timeout"
 )
 
 func init() {
@@ -83,15 +88,17 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	extra, err := info.ExtraAttributes(nil)
+	extraAttrs, err := info.ExtraAttributes(nil)
 	if err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	logrus.WithField("container", info.ContainerID).WithField("config", fluentConfig).
-		Debug("logging driver fluentd configured")
+	log.G(context.TODO()).WithFields(log.Fields{
+		"container": info.ContainerID,
+		"config":    fluentConfig,
+	}).Debug("logging driver fluentd configured")
 
-	log, err := fluent.New(fluentConfig)
+	writer, err := fluent.New(fluentConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -99,8 +106,8 @@ func New(info logger.Info) (logger.Logger, error) {
 		tag:           tag,
 		containerID:   info.ContainerID,
 		containerName: info.ContainerName,
-		writer:        log,
-		extra:         extra,
+		writer:        writer,
+		extra:         extraAttrs,
 	}, nil
 }
 
@@ -148,13 +155,13 @@ func ValidateLogOpt(cfg map[string]string) error {
 
 		case addressKey:
 		case asyncKey:
-		case asyncConnectKey:
 		case asyncReconnectIntervalKey:
 		case bufferLimitKey:
 		case maxRetriesKey:
 		case requestAckKey:
 		case retryWaitKey:
 		case subSecondPrecisionKey:
+		case writeTimeoutKey:
 			// Accepted
 		default:
 			return errors.Errorf("unknown log opt '%s' for fluentd log driver", key)
@@ -193,15 +200,17 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 
 	maxRetries := defaultMaxRetries
 	if cfg[maxRetriesKey] != "" {
-		mr64, err := strconv.ParseUint(cfg[maxRetriesKey], 10, strconv.IntSize)
+		mr64, err := strconv.ParseUint(cfg[maxRetriesKey], 10, 32)
 		if err != nil {
 			return config, err
 		}
-		maxRetries = int(mr64)
-	}
 
-	if cfg[asyncKey] != "" && cfg[asyncConnectKey] != "" {
-		return config, errors.Errorf("conflicting options: cannot specify both '%s' and '%s", asyncKey, asyncConnectKey)
+		// cap to MaxInt32 to prevent overflowing, and which is documented on
+		// defaultMaxRetries to be the limit above which things fail.
+		if mr64 > math.MaxInt32 {
+			return config, errors.New("invalid fluentd-max-retries: value out of range")
+		}
+		maxRetries = int(mr64)
 	}
 
 	async := false
@@ -211,25 +220,19 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		}
 	}
 
-	// TODO fluentd-async-connect is deprecated in driver v1.4.0. Remove after two stable releases
-	asyncConnect := false
-	if cfg[asyncConnectKey] != "" {
-		if asyncConnect, err = strconv.ParseBool(cfg[asyncConnectKey]); err != nil {
-			return config, err
-		}
-	}
-
-	asyncReconnectInterval := 0
+	var asyncReconnectInterval int
 	if cfg[asyncReconnectIntervalKey] != "" {
 		interval, err := time.ParseDuration(cfg[asyncReconnectIntervalKey])
 		if err != nil {
 			return config, errors.Wrapf(err, "invalid value for %s", asyncReconnectIntervalKey)
 		}
-		if interval != 0 && (interval < minReconnectInterval || interval > maxReconnectInterval) {
-			return config, errors.Errorf("invalid value for %s: value (%q) must be between %s and %s",
-				asyncReconnectIntervalKey, interval, minReconnectInterval, maxReconnectInterval)
+		if interval != 0 {
+			if interval < minReconnectInterval || interval > maxReconnectInterval {
+				return config, errors.Errorf("invalid value for %s: value (%q) must be between %s and %s",
+					asyncReconnectIntervalKey, interval, minReconnectInterval, maxReconnectInterval)
+			}
+			asyncReconnectInterval = int(interval.Milliseconds())
 		}
-		asyncReconnectInterval = int(interval.Milliseconds())
 	}
 
 	subSecondPrecision := false
@@ -246,6 +249,17 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		}
 	}
 
+	writeTimeout := time.Duration(0)
+	if cfg[writeTimeoutKey] != "" {
+		if d, err := time.ParseDuration(cfg[writeTimeoutKey]); err != nil {
+			return config, errors.Wrapf(err, "invalid value for %s: value must be a duration", writeTimeoutKey)
+		} else if d < 0 {
+			return config, errors.Errorf("invalid value for %s: value must be a duration that is non-negative", writeTimeoutKey)
+		} else {
+			writeTimeout = d
+		}
+	}
+
 	config = fluent.Config{
 		FluentPort:             loc.port,
 		FluentHost:             loc.host,
@@ -255,11 +269,11 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		RetryWait:              retryWait,
 		MaxRetry:               maxRetries,
 		Async:                  async,
-		AsyncConnect:           asyncConnect,
 		AsyncReconnectInterval: asyncReconnectInterval,
 		SubSecondPrecision:     subSecondPrecision,
 		RequestAck:             requestAck,
-		ForceStopAsyncSend:     async || asyncConnect,
+		ForceStopAsyncSend:     async,
+		WriteTimeout:           writeTimeout,
 	}
 
 	return config, nil

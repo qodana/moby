@@ -1,17 +1,20 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImagePullReferenceParseError(t *testing.T) {
@@ -21,83 +24,71 @@ func TestImagePullReferenceParseError(t *testing.T) {
 		}),
 	}
 	// An empty reference is an invalid reference
-	_, err := client.ImagePull(context.Background(), "", types.ImagePullOptions{})
-	if err == nil || !strings.Contains(err.Error(), "invalid reference format") {
-		t.Fatalf("expected an error, got %v", err)
-	}
+	_, err := client.ImagePull(context.Background(), "", image.PullOptions{})
+	assert.Check(t, is.ErrorContains(err, "invalid reference format"))
 }
 
 func TestImagePullAnyError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	_, err := client.ImagePull(context.Background(), "myimage", types.ImagePullOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err := client.ImagePull(context.Background(), "myimage", image.PullOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImagePullStatusUnauthorizedError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	_, err := client.ImagePull(context.Background(), "myimage", types.ImagePullOptions{})
-	if !errdefs.IsUnauthorized(err) {
-		t.Fatalf("expected a Unauthorized Error, got %[1]T: %[1]v", err)
-	}
+	_, err := client.ImagePull(context.Background(), "myimage", image.PullOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsUnauthorized))
 }
 
 func TestImagePullWithUnauthorizedErrorAndPrivilegeFuncError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	privilegeFunc := func() (string, error) {
-		return "", fmt.Errorf("Error requesting privilege")
-	}
-	_, err := client.ImagePull(context.Background(), "myimage", types.ImagePullOptions{
-		PrivilegeFunc: privilegeFunc,
+	_, err := client.ImagePull(context.Background(), "myimage", image.PullOptions{
+		PrivilegeFunc: func(_ context.Context) (string, error) {
+			return "", errors.New("error requesting privilege")
+		},
 	})
-	if err == nil || err.Error() != "Error requesting privilege" {
-		t.Fatalf("expected an error requesting privilege, got %v", err)
-	}
+	assert.Check(t, is.Error(err, "error requesting privilege"))
 }
 
 func TestImagePullWithUnauthorizedErrorAndAnotherUnauthorizedError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusUnauthorized, "Unauthorized error")),
 	}
-	privilegeFunc := func() (string, error) {
-		return "a-auth-header", nil
-	}
-	_, err := client.ImagePull(context.Background(), "myimage", types.ImagePullOptions{
-		PrivilegeFunc: privilegeFunc,
+	_, err := client.ImagePull(context.Background(), "myimage", image.PullOptions{
+		PrivilegeFunc: staticAuth("a-auth-header"),
 	})
-	if !errdefs.IsUnauthorized(err) {
-		t.Fatalf("expected a Unauthorized Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsUnauthorized))
 }
 
 func TestImagePullWithPrivilegedFuncNoError(t *testing.T) {
-	expectedURL := "/images/create"
+	const expectedURL = "/images/create"
+	const invalidAuth = "NotValid"
+	const validAuth = "IAmValid"
 	client := &Client{
 		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
 			auth := req.Header.Get(registry.AuthHeader)
-			if auth == "NotValid" {
+			if auth == invalidAuth {
 				return &http.Response{
 					StatusCode: http.StatusUnauthorized,
 					Body:       io.NopCloser(bytes.NewReader([]byte("Invalid credentials"))),
 				}, nil
 			}
-			if auth != "IAmValid" {
+			if auth != validAuth {
 				return nil, fmt.Errorf("invalid auth header: expected %s, got %s", "IAmValid", auth)
 			}
 			query := req.URL.Query()
 			fromImage := query.Get("fromImage")
-			if fromImage != "myimage" {
-				return nil, fmt.Errorf("fromimage not set in URL query properly. Expected '%s', got %s", "myimage", fromImage)
+			if fromImage != "docker.io/library/myimage" {
+				return nil, fmt.Errorf("fromimage not set in URL query properly. Expected '%s', got %s", "docker.io/library/myimage", fromImage)
 			}
 			tag := query.Get("tag")
 			if tag != "latest" {
@@ -109,28 +100,21 @@ func TestImagePullWithPrivilegedFuncNoError(t *testing.T) {
 			}, nil
 		}),
 	}
-	privilegeFunc := func() (string, error) {
-		return "IAmValid", nil
-	}
-	resp, err := client.ImagePull(context.Background(), "myimage", types.ImagePullOptions{
-		RegistryAuth:  "NotValid",
-		PrivilegeFunc: privilegeFunc,
+	resp, err := client.ImagePull(context.Background(), "myimage", image.PullOptions{
+		RegistryAuth:  invalidAuth,
+		PrivilegeFunc: staticAuth(validAuth),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 	body, err := io.ReadAll(resp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "hello world" {
-		t.Fatalf("expected 'hello world', got %s", string(body))
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(body), "hello world"))
 }
 
 func TestImagePullWithoutErrors(t *testing.T) {
-	expectedURL := "/images/create"
-	expectedOutput := "hello world"
+	const (
+		expectedURL    = "/images/create"
+		expectedOutput = "hello world"
+	)
 	pullCases := []struct {
 		all           bool
 		reference     string
@@ -140,61 +124,82 @@ func TestImagePullWithoutErrors(t *testing.T) {
 		{
 			all:           false,
 			reference:     "myimage",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "latest",
 		},
 		{
 			all:           false,
 			reference:     "myimage:tag",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "tag",
 		},
 		{
 			all:           true,
 			reference:     "myimage",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "",
 		},
 		{
 			all:           true,
 			reference:     "myimage:anything",
-			expectedImage: "myimage",
+			expectedImage: "docker.io/library/myimage",
 			expectedTag:   "",
+		},
+		{
+			reference:     "myname/myimage",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "docker.io/myname/myimage",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "index.docker.io/myname/myimage:tag",
+			expectedImage: "docker.io/myname/myimage",
+			expectedTag:   "tag",
+		},
+		{
+			reference:     "localhost/myname/myimage",
+			expectedImage: "localhost/myname/myimage",
+			expectedTag:   "latest",
+		},
+		{
+			reference:     "registry.example.com:5000/myimage:tag",
+			expectedImage: "registry.example.com:5000/myimage",
+			expectedTag:   "tag",
 		},
 	}
 	for _, pullCase := range pullCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				query := req.URL.Query()
-				fromImage := query.Get("fromImage")
-				if fromImage != pullCase.expectedImage {
-					return nil, fmt.Errorf("fromimage not set in URL query properly. Expected '%s', got %s", pullCase.expectedImage, fromImage)
-				}
-				tag := query.Get("tag")
-				if tag != pullCase.expectedTag {
-					return nil, fmt.Errorf("tag not set in URL query properly. Expected '%s', got %s", pullCase.expectedTag, tag)
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte(expectedOutput))),
-				}, nil
-			}),
-		}
-		resp, err := client.ImagePull(context.Background(), pullCase.reference, types.ImagePullOptions{
-			All: pullCase.all,
+		t.Run(pullCase.reference, func(t *testing.T) {
+			client := &Client{
+				client: newMockClient(func(req *http.Request) (*http.Response, error) {
+					if !strings.HasPrefix(req.URL.Path, expectedURL) {
+						return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
+					}
+					query := req.URL.Query()
+					fromImage := query.Get("fromImage")
+					if fromImage != pullCase.expectedImage {
+						return nil, fmt.Errorf("fromimage not set in URL query properly. Expected '%s', got %s", pullCase.expectedImage, fromImage)
+					}
+					tag := query.Get("tag")
+					if tag != pullCase.expectedTag {
+						return nil, fmt.Errorf("tag not set in URL query properly. Expected '%s', got %s", pullCase.expectedTag, tag)
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(bytes.NewReader([]byte(expectedOutput))),
+					}, nil
+				}),
+			}
+			resp, err := client.ImagePull(context.Background(), pullCase.reference, image.PullOptions{
+				All: pullCase.all,
+			})
+			assert.NilError(t, err)
+			body, err := io.ReadAll(resp)
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(string(body), expectedOutput))
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, err := io.ReadAll(resp)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(body) != expectedOutput {
-			t.Fatalf("expected '%s', got %s", expectedOutput, string(body))
-		}
 	}
 }

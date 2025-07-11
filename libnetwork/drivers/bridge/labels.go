@@ -7,6 +7,11 @@ const (
 	// EnableIPMasquerade label for bridge driver
 	EnableIPMasquerade = "com.docker.network.bridge.enable_ip_masquerade"
 
+	// IPv4GatewayMode label for bridge driver
+	IPv4GatewayMode = "com.docker.network.bridge.gateway_mode_ipv4"
+	// IPv6GatewayMode label for bridge driver
+	IPv6GatewayMode = "com.docker.network.bridge.gateway_mode_ipv6"
+
 	// EnableICC label
 	EnableICC = "com.docker.network.bridge.enable_icc"
 
@@ -18,4 +23,8 @@ const (
 
 	// DefaultBridge label
 	DefaultBridge = "com.docker.network.bridge.default_bridge"
+
+	// TrustedHostInterfaces can be used to supply a list of host interfaces that are
+	// allowed direct access to published ports on a container's address.
+	TrustedHostInterfaces = "com.docker.network.bridge.trusted_host_interfaces"
 )

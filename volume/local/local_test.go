@@ -1,4 +1,4 @@
-package local // import "github.com/docker/docker/volume/local"
+package local
 
 import (
 	"os"
@@ -49,11 +49,7 @@ func TestGetPassword(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	skip.If(t, runtime.GOOS == "windows", "FIXME: investigate why this test fails on CI")
-	rootDir, err := os.MkdirTemp("", "local-volume-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootDir)
+	rootDir := t.TempDir()
 
 	r, err := New(rootDir, idtools.Identity{UID: os.Geteuid(), GID: os.Getegid()})
 	if err != nil {
@@ -91,11 +87,7 @@ func TestRemove(t *testing.T) {
 }
 
 func TestInitializeWithVolumes(t *testing.T) {
-	rootDir, err := os.MkdirTemp("", "local-volume-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootDir)
+	rootDir := t.TempDir()
 
 	r, err := New(rootDir, idtools.Identity{UID: os.Geteuid(), GID: os.Getegid()})
 	if err != nil {
@@ -123,11 +115,7 @@ func TestInitializeWithVolumes(t *testing.T) {
 }
 
 func TestCreate(t *testing.T) {
-	rootDir, err := os.MkdirTemp("", "local-volume-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootDir)
+	rootDir := t.TempDir()
 
 	r, err := New(rootDir, idtools.Identity{UID: os.Geteuid(), GID: os.Getegid()})
 	if err != nil {
@@ -197,11 +185,7 @@ func TestValidateName(t *testing.T) {
 func TestCreateWithOpts(t *testing.T) {
 	skip.If(t, runtime.GOOS == "windows")
 	skip.If(t, os.Getuid() != 0, "requires mounts")
-	rootDir, err := os.MkdirTemp("", "local-volume-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootDir)
+	rootDir := t.TempDir()
 
 	r, err := New(rootDir, idtools.Identity{UID: os.Geteuid(), GID: os.Getegid()})
 	if err != nil {
@@ -293,12 +277,8 @@ func TestCreateWithOpts(t *testing.T) {
 	}
 }
 
-func TestRelaodNoOpts(t *testing.T) {
-	rootDir, err := os.MkdirTemp("", "volume-test-reload-no-opts")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootDir)
+func TestReloadNoOpts(t *testing.T) {
+	rootDir := t.TempDir()
 
 	r, err := New(rootDir, idtools.Identity{UID: os.Geteuid(), GID: os.Getegid()})
 	if err != nil {
@@ -312,7 +292,7 @@ func TestRelaodNoOpts(t *testing.T) {
 		t.Fatal(err)
 	}
 	// make sure a file with `null` (.e.g. empty opts map from older daemon) is ok
-	if err := os.WriteFile(filepath.Join(rootDir, "test2"), []byte("null"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(rootDir, "test2"), []byte("null"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -320,7 +300,7 @@ func TestRelaodNoOpts(t *testing.T) {
 		t.Fatal(err)
 	}
 	// make sure an empty opts file doesn't break us too
-	if err := os.WriteFile(filepath.Join(rootDir, "test3"), nil, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(rootDir, "test3"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

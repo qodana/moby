@@ -1,10 +1,10 @@
 package driverapi
 
 import (
+	"context"
 	"net"
 
-	"github.com/docker/docker/libnetwork/discoverapi"
-	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/docker/docker/libnetwork/options"
 )
 
 // NetworkPluginEndpointType represents the Endpoint Type used by Plugin system
@@ -12,8 +12,6 @@ const NetworkPluginEndpointType = "NetworkDriver"
 
 // Driver is an interface that every plugin driver needs to implement.
 type Driver interface {
-	discoverapi.Discover
-
 	// NetworkAllocate invokes the driver method to allocate network
 	// specific resources passing network id and network specific config.
 	// It returns a key,value pair of network specific driver allocations
@@ -32,7 +30,7 @@ type Driver interface {
 	// notification when a CRUD operation is performed on any
 	// entry in that table. This will be ignored for local scope
 	// drivers.
-	CreateNetwork(nid string, options map[string]interface{}, nInfo NetworkInfo, ipV4Data, ipV6Data []IPAMData) error
+	CreateNetwork(ctx context.Context, nid string, options map[string]interface{}, nInfo NetworkInfo, ipV4Data, ipV6Data []IPAMData) error
 
 	// DeleteNetwork invokes the driver method to delete network passing
 	// the network id.
@@ -43,7 +41,7 @@ type Driver interface {
 	// specific config. The endpoint information can be either consumed by
 	// the driver or populated by the driver. The config mechanism will
 	// eventually be replaced with labels which are yet to be introduced.
-	CreateEndpoint(nid, eid string, ifInfo InterfaceInfo, options map[string]interface{}) error
+	CreateEndpoint(ctx context.Context, nid, eid string, ifInfo InterfaceInfo, options map[string]interface{}) error
 
 	// DeleteEndpoint invokes the driver method to delete an endpoint
 	// passing the network id and endpoint id.
@@ -53,18 +51,10 @@ type Driver interface {
 	EndpointOperInfo(nid, eid string) (map[string]interface{}, error)
 
 	// Join method is invoked when a Sandbox is attached to an endpoint.
-	Join(nid, eid string, sboxKey string, jinfo JoinInfo, options map[string]interface{}) error
+	Join(ctx context.Context, nid, eid string, sboxKey string, jinfo JoinInfo, epOpts, sbOpts map[string]interface{}) error
 
 	// Leave method is invoked when a Sandbox detaches from an endpoint.
 	Leave(nid, eid string) error
-
-	// ProgramExternalConnectivity invokes the driver method which does the necessary
-	// programming to allow the external connectivity dictated by the passed options
-	ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error
-
-	// RevokeExternalConnectivity asks the driver to remove any external connectivity
-	// programming that was done so far
-	RevokeExternalConnectivity(nid, eid string) error
 
 	// EventNotify notifies the driver when a CRUD operation has
 	// happened on a table of its interest as soon as this node
@@ -89,6 +79,30 @@ type Driver interface {
 	IsBuiltIn() bool
 }
 
+// ExtConner is an optional interface for a network driver.
+type ExtConner interface {
+	// ProgramExternalConnectivity tells the driver the ids of the endpoints
+	// currently acting as the container's default gateway for IPv4 and IPv6,
+	// passed as gw4Id/gw6Id. (Those endpoints may be managed by different network
+	// drivers. If there is no gateway, the id will be the empty string.)
+	//
+	// This method is called after Driver.Join, before Driver.Leave, and when eid
+	// is or was equal to gw4Id or gw6Id, and there's a change. It may also be
+	// called when the gateways have not changed.
+	//
+	// When an endpoint acting as a gateway is deleted, this function is called
+	// with that endpoint's id in eid, and empty gateway ids (even if another
+	// is present and will shortly be selected as the gateway).
+	ProgramExternalConnectivity(ctx context.Context, nid, eid string, gw4Id, gw6Id string) error
+}
+
+// GwAllocChecker is an optional interface for a network driver.
+type GwAllocChecker interface {
+	// GetSkipGwAlloc returns true if the opts describe a network
+	// that does not need a gateway IPv4/IPv6 address, else false.
+	GetSkipGwAlloc(opts options.Generic) (skipIPv4, skipIPv6 bool, err error)
+}
+
 // NetworkInfo provides a go interface for drivers to provide network
 // specific information to libnetwork.
 type NetworkInfo interface {
@@ -96,7 +110,7 @@ type NetworkInfo interface {
 	// table name.
 	TableEventRegister(tableName string, objType ObjectType) error
 
-	// UpdateIPamConfig updates the networks IPAM configuration
+	// UpdateIpamConfig updates the networks IPAM configuration
 	// based on information from the driver.  In windows, the OS (HNS) chooses
 	// the IP address space if the user does not specify an address space.
 	UpdateIpamConfig(ipV4Data []IPAMData)
@@ -122,13 +136,23 @@ type InterfaceInfo interface {
 
 	// AddressIPv6 returns the IPv6 address.
 	AddressIPv6() *net.IPNet
+
+	// NetnsPath returns the path of the network namespace, if there is one. Else "".
+	NetnsPath() string
+
+	// SetCreatedInContainer can be called by the driver to indicate that it's
+	// created the network interface in the container's network namespace (so,
+	// it doesn't need to be moved there).
+	SetCreatedInContainer(bool)
 }
 
 // InterfaceNameInfo provides a go interface for the drivers to assign names
 // to interfaces.
 type InterfaceNameInfo interface {
-	// SetNames method assigns the srcName and dstPrefix for the interface.
-	SetNames(srcName, dstPrefix string) error
+	// SetNames method assigns the srcName, dstPrefix, and dstName for the
+	// interface. If both dstName and dstPrefix are set, dstName takes
+	// precedence.
+	SetNames(srcName, dstPrefix, dstName string) error
 }
 
 // JoinInfo represents a set of resources that the driver has the ability to provide during
@@ -159,13 +183,6 @@ type JoinInfo interface {
 // Registerer provides a way for network drivers to be dynamically registered.
 type Registerer interface {
 	RegisterDriver(name string, driver Driver, capability Capability) error
-}
-
-// DriverCallback provides a Callback interface for Drivers into LibNetwork
-type DriverCallback interface {
-	Registerer
-	// GetPluginGetter returns the pluginv2 getter.
-	GetPluginGetter() plugingetter.PluginGetter
 }
 
 // Capability represents the high level capabilities of the drivers which libnetwork can make use of

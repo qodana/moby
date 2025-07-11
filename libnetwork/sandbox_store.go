@@ -1,12 +1,16 @@
 package libnetwork
 
 import (
+	"context"
 	"encoding/json"
-	"sync"
+	"errors"
+	"fmt"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/osl"
-	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/libnetwork/scope"
+	"github.com/docker/docker/pkg/stringid"
 )
 
 const (
@@ -119,11 +123,7 @@ func (sbs *sbState) CopyTo(o datastore.KVObject) error {
 	return nil
 }
 
-func (sbs *sbState) DataScope() string {
-	return datastore.LocalScope
-}
-
-func (sb *Sandbox) storeUpdate() error {
+func (sb *Sandbox) storeUpdate(ctx context.Context) error {
 	sbs := &sbState{
 		c:          sb.controller,
 		ID:         sb.id,
@@ -141,16 +141,14 @@ retry:
 			continue
 		}
 
-		eps := epState{
+		sbs.Eps = append(sbs.Eps, epState{
 			Nid: ep.getNetwork().ID(),
 			Eid: ep.ID(),
-		}
-
-		sbs.Eps = append(sbs.Eps, eps)
+		})
 	}
 
-	err := sb.controller.updateToStore(sbs)
-	if err == datastore.ErrKeyModified {
+	err := sb.controller.updateToStore(ctx, sbs)
+	if errors.Is(err, datastore.ErrKeyModified) {
 		// When we get ErrKeyModified it is sufficient to just
 		// go back and retry.  No need to get the object from
 		// the store because we always regenerate the store
@@ -162,42 +160,32 @@ retry:
 }
 
 func (sb *Sandbox) storeDelete() error {
-	sbs := &sbState{
+	return sb.controller.store.DeleteObject(&sbState{
 		c:        sb.controller,
 		ID:       sb.id,
 		Cid:      sb.containerID,
-		dbIndex:  sb.dbIndex,
 		dbExists: sb.dbExists,
-	}
-
-	return sb.controller.deleteFromStore(sbs)
+	})
 }
 
-func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
-	store := c.getStore()
-	if store == nil {
-		logrus.Error("Could not find local scope store while trying to cleanup sandboxes")
-		return
+// sandboxRestore restores Sandbox objects from the store, deleting them if they're not active.
+func (c *Controller) sandboxRestore(activeSandboxes map[string]interface{}) error {
+	sandboxStates, err := c.store.List(&sbState{c: c})
+	if err != nil {
+		if errors.Is(err, datastore.ErrKeyNotFound) {
+			// It's normal for no sandboxes to be found. Just bail out.
+			return nil
+		}
+		return fmt.Errorf("failed to get sandboxes: %v", err)
 	}
 
-	kvol, err := store.List(datastore.Key(sandboxPrefix), &sbState{c: c})
-	if err != nil && err != datastore.ErrKeyNotFound {
-		logrus.Errorf("failed to get sandboxes for scope %s: %v", store.Scope(), err)
-		return
-	}
-
-	// It's normal for no sandboxes to be found. Just bail out.
-	if err == datastore.ErrKeyNotFound {
-		return
-	}
-
-	for _, kvo := range kvol {
-		sbs := kvo.(*sbState)
-
+	for _, s := range sandboxStates {
+		sbs := s.(*sbState)
 		sb := &Sandbox{
 			id:                 sbs.ID,
 			controller:         sbs.c,
 			containerID:        sbs.Cid,
+			epPriority:         sbs.EpPriority,
 			extDNS:             sbs.ExtDNS,
 			endpoints:          []*Endpoint{},
 			populatedEndpoints: map[string]struct{}{},
@@ -206,21 +194,28 @@ func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 			dbExists:           true,
 		}
 
-		msg := " for cleanup"
 		create := true
 		isRestore := false
 		if val, ok := activeSandboxes[sb.ID()]; ok {
-			msg = ""
 			sb.isStub = false
 			isRestore = true
 			opts := val.([]SandboxOption)
 			sb.processOptions(opts...)
-			sb.restorePath()
+			sb.restoreHostsPath()
+			sb.restoreResolvConfPath()
 			create = !sb.config.useDefaultSandBox
 		}
+
+		ctx := context.TODO()
+		ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+			"sid":       stringid.TruncateID(sb.ID()),
+			"cid":       stringid.TruncateID(sb.ContainerID()),
+			"isRestore": isRestore,
+		}))
+
 		sb.osSbox, err = osl.NewSandbox(sb.Key(), create, isRestore)
 		if err != nil {
-			logrus.Errorf("failed to create osl sandbox while trying to restore sandbox %.7s%s: %v", sb.ID(), msg, err)
+			log.G(ctx).WithError(err).Error("Failed to create osl sandbox while trying to restore sandbox")
 			continue
 		}
 
@@ -229,51 +224,61 @@ func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 		c.mu.Unlock()
 
 		for _, eps := range sbs.Eps {
+			ctx := log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+				"nid": stringid.TruncateID(eps.Nid),
+				"eid": stringid.TruncateID(eps.Eid),
+			}))
+			// If the Network or Endpoint can't be loaded from the store, log and continue. Something
+			// might go wrong later, but it might just be a reference to a deleted network/endpoint
+			// (in which case, the best thing to do is to continue to run/delete the Sandbox with the
+			// available configuration).
 			n, err := c.getNetworkFromStore(eps.Nid)
-			var ep *Endpoint
 			if err != nil {
-				logrus.Errorf("getNetworkFromStore for nid %s failed while trying to build sandbox for cleanup: %v", eps.Nid, err)
-				n = &network{id: eps.Nid, ctrlr: c, drvOnce: &sync.Once{}, persist: true}
-				ep = &Endpoint{id: eps.Eid, network: n, sandboxID: sbs.ID}
-			} else {
-				ep, err = n.getEndpointFromStore(eps.Eid)
-				if err != nil {
-					logrus.Errorf("getEndpointFromStore for eid %s failed while trying to build sandbox for cleanup: %v", eps.Eid, err)
-					ep = &Endpoint{id: eps.Eid, network: n, sandboxID: sbs.ID}
-				}
+				log.G(ctx).WithError(err).Warn("Failed to restore endpoint, getNetworkFromStore failed")
+				continue
 			}
-			if _, ok := activeSandboxes[sb.ID()]; ok && err != nil {
-				logrus.Errorf("failed to restore endpoint %s in %s for container %s due to %v", eps.Eid, eps.Nid, sb.ContainerID(), err)
+			ep, err := n.getEndpointFromStore(eps.Eid)
+			if err != nil {
+				log.G(ctx).WithError(err).Warn("Failed to restore endpoint, getEndpointFromStore failed")
 				continue
 			}
 			sb.addEndpoint(ep)
 		}
 
-		if _, ok := activeSandboxes[sb.ID()]; !ok {
-			logrus.Infof("Removing stale sandbox %s (%s)", sb.id, sb.containerID)
-			if err := sb.delete(true); err != nil {
-				logrus.Errorf("Failed to delete sandbox %s while trying to cleanup: %v", sb.id, err)
+		if !isRestore {
+			log.G(ctx).Info("Removing stale sandbox")
+			if err := sb.delete(context.WithoutCancel(ctx), true); err != nil {
+				log.G(ctx).WithError(err).Warn("Failed to delete sandbox while trying to clean up")
 			}
 			continue
+		}
+
+		for _, ep := range sb.endpoints {
+			sb.populatedEndpoints[ep.id] = struct{}{}
 		}
 
 		// reconstruct osl sandbox field
 		if !sb.config.useDefaultSandBox {
 			if err := sb.restoreOslSandbox(); err != nil {
-				logrus.Errorf("failed to populate fields for osl sandbox %s", sb.ID())
+				log.G(ctx).WithError(err).Error("Failed to populate fields for osl sandbox")
 				continue
 			}
 		} else {
-			c.sboxOnce.Do(func() {
+			// FIXME(thaJeztah): osSbox (and thus defOsSbox) is always nil on non-Linux: move this code to Linux-only files.
+			c.defOsSboxOnce.Do(func() {
 				c.defOsSbox = sb.osSbox
 			})
 		}
 
 		for _, ep := range sb.endpoints {
-			// Watch for service records
 			if !c.isAgent() {
-				c.watchSvcRecord(ep)
+				n := ep.getNetwork()
+				if !c.isSwarmNode() || n.Scope() != scope.Swarm || !n.driverIsMultihost() {
+					n.updateSvcRecord(context.WithoutCancel(ctx), ep, true)
+				}
 			}
 		}
 	}
+
+	return nil
 }

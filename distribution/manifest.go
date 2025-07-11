@@ -7,20 +7,18 @@ import (
 	"io"
 	"strings"
 
-	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
-	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/registry"
 	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // labelDistributionSource describes the source blob comes from.
@@ -97,7 +95,7 @@ func hasDistributionSource(label, repo string) bool {
 	return false
 }
 
-func (m *manifestStore) getLocal(ctx context.Context, desc specs.Descriptor, ref reference.Named) (distribution.Manifest, error) {
+func (m *manifestStore) getLocal(ctx context.Context, desc ocispec.Descriptor, ref reference.Named) (distribution.Manifest, error) {
 	ra, err := m.local.ReaderAt(ctx, desc)
 	if err != nil {
 		return nil, errors.Wrap(err, "error getting content store reader")
@@ -117,7 +115,7 @@ func (m *manifestStore) getLocal(ctx context.Context, desc specs.Descriptor, ref
 		// If we haven't, we need to check the remote repository to see if it has the content, otherwise we can end up returning
 		// a manifest that has never even existed in the remote before.
 		if !hasDistributionSource(info.Labels[distKey], distRepo) {
-			logrus.WithField("ref", ref).Debug("found manifest but no mataching source repo is listed, checking with remote")
+			log.G(ctx).WithField("ref", ref).Debug("found manifest but no mataching source repo is listed, checking with remote")
 			exists, err := m.remote.Exists(ctx, desc.Digest)
 			if err != nil {
 				return nil, errors.Wrap(err, "error checking if remote exists")
@@ -136,7 +134,7 @@ func (m *manifestStore) getLocal(ctx context.Context, desc specs.Descriptor, ref
 	}
 	info.Labels[distKey] = appendDistributionSourceLabel(info.Labels[distKey], distRepo)
 	if _, err := m.local.Update(ctx, info, "labels."+distKey); err != nil {
-		logrus.WithError(err).WithField("ref", ref).Warn("Could not update content distribution source")
+		log.G(ctx).WithError(err).WithField("ref", ref).Warn("Could not update content distribution source")
 	}
 
 	r := io.NewSectionReader(ra, 0, ra.Size())
@@ -153,7 +151,7 @@ func (m *manifestStore) getLocal(ctx context.Context, desc specs.Descriptor, ref
 	return manifest, nil
 }
 
-func (m *manifestStore) getMediaType(ctx context.Context, desc specs.Descriptor) (string, error) {
+func (m *manifestStore) getMediaType(ctx context.Context, desc ocispec.Descriptor) (string, error) {
 	ra, err := m.local.ReaderAt(ctx, desc)
 	if err != nil {
 		return "", errors.Wrap(err, "error getting reader to detect media type")
@@ -167,7 +165,7 @@ func (m *manifestStore) getMediaType(ctx context.Context, desc specs.Descriptor)
 	return mt, nil
 }
 
-func (m *manifestStore) Get(ctx context.Context, desc specs.Descriptor, ref reference.Named) (distribution.Manifest, error) {
+func (m *manifestStore) Get(ctx context.Context, desc ocispec.Descriptor, ref reference.Named) (distribution.Manifest, error) {
 	l := log.G(ctx)
 
 	if desc.MediaType == "" {
@@ -227,13 +225,12 @@ func (m *manifestStore) Get(ctx context.Context, desc specs.Descriptor, ref refe
 	return manifest, nil
 }
 
-func (m *manifestStore) Put(ctx context.Context, manifest distribution.Manifest, desc specs.Descriptor, w content.Writer, ref reference.Named) error {
-	mt, payload, err := manifest.Payload()
+func (m *manifestStore) Put(ctx context.Context, manifest distribution.Manifest, desc ocispec.Descriptor, w content.Writer, ref reference.Named) error {
+	_, payload, err := manifest.Payload()
 	if err != nil {
 		return err
 	}
 	desc.Size = int64(len(payload))
-	desc.MediaType = mt
 
 	if _, err = w.Write(payload); err != nil {
 		return errors.Wrap(err, "error writing manifest to content store")
@@ -251,11 +248,32 @@ func (m *manifestStore) Put(ctx context.Context, manifest distribution.Manifest,
 func detectManifestMediaType(ra content.ReaderAt) (string, error) {
 	dt := make([]byte, ra.Size())
 	if _, err := ra.ReadAt(dt, 0); err != nil {
-		return "", err
+		return "", fmt.Errorf("error detecting media type: %w", err)
 	}
 
 	return detectManifestBlobMediaType(dt)
 }
+
+const (
+	// MediaTypeDockerSchema1Manifest specifies the mediaType for legacy "docker v1" manifests.
+	// It is a local copy of [schema1.MediaTypeManifest]. Note that for schema version 1, the media
+	// is optionally "application/json".
+	//
+	// This const is meant for internal use and should not be used externally as
+	// it may be removed in a future release.
+	//
+	// [schema1.MediaTypeManifest]: https://pkg.go.dev/github.com/docker/distribution@v2.8.3+incompatible/manifest/schema1#MediaTypeManifest
+	MediaTypeDockerSchema1Manifest = "application/vnd.docker.distribution.manifest.v1+json"
+
+	// MediaTypeDockerSchema1SignedManifest specifies the mediatype for legacy "docker v1" signed manifests.
+	// It is a local copy of [schema1.MediaTypeSignedManifest].
+	//
+	// This const is meant for internal use and should not be used externally as
+	// it may be removed in a future release.
+	//
+	// [schema1.MediaTypeSignedManifest]: https://pkg.go.dev/github.com/docker/distribution@v2.8.3+incompatible/manifest/schema1#MediaTypeSignedManifest
+	MediaTypeDockerSchema1SignedManifest = "application/vnd.docker.distribution.manifest.v1+prettyjws"
+)
 
 // This is used when the manifest store does not know the media type of a sha it
 // was told to get. This would currently only happen when pulling by digest.
@@ -282,21 +300,18 @@ func detectManifestBlobMediaType(dt []byte) (string, error) {
 	// So pretty much if we don't have a media type we can fall back to OCI.
 	// This does have a special fallback for schema1 manifests just because it is easy to detect.
 	switch mfst.MediaType {
-	case schema2.MediaTypeManifest, specs.MediaTypeImageManifest:
+	case schema2.MediaTypeManifest, ocispec.MediaTypeImageManifest:
 		if mfst.Manifests != nil || mfst.FSLayers != nil {
 			return "", fmt.Errorf(`media-type: %q should not have "manifests" or "fsLayers"`, mfst.MediaType)
 		}
 		return mfst.MediaType, nil
-	case manifestlist.MediaTypeManifestList, specs.MediaTypeImageIndex:
+	case manifestlist.MediaTypeManifestList, ocispec.MediaTypeImageIndex:
 		if mfst.Config != nil || mfst.Layers != nil || mfst.FSLayers != nil {
 			return "", fmt.Errorf(`media-type: %q should not have "config", "layers", or "fsLayers"`, mfst.MediaType)
 		}
 		return mfst.MediaType, nil
-	case schema1.MediaTypeManifest:
-		if mfst.Manifests != nil || mfst.Layers != nil {
-			return "", fmt.Errorf(`media-type: %q should not have "manifests" or "layers"`, mfst.MediaType)
-		}
-		return mfst.MediaType, nil
+	case MediaTypeDockerSchema1Manifest, MediaTypeDockerSchema1SignedManifest:
+		return "", DeprecatedSchema1ImageError(nil)
 	default:
 		if mfst.MediaType != "" {
 			return mfst.MediaType, nil
@@ -304,13 +319,13 @@ func detectManifestBlobMediaType(dt []byte) (string, error) {
 	}
 	switch {
 	case mfst.FSLayers != nil && mfst.Manifests == nil && mfst.Layers == nil && mfst.Config == nil:
-		return schema1.MediaTypeManifest, nil
+		return "", DeprecatedSchema1ImageError(nil)
 	case mfst.Config != nil && mfst.Manifests == nil && mfst.FSLayers == nil,
 		mfst.Layers != nil && mfst.Manifests == nil && mfst.FSLayers == nil:
-		return specs.MediaTypeImageManifest, nil
+		return ocispec.MediaTypeImageManifest, nil
 	case mfst.Config == nil && mfst.Layers == nil && mfst.FSLayers == nil:
 		// fallback to index
-		return specs.MediaTypeImageIndex, nil
+		return ocispec.MediaTypeImageIndex, nil
 	}
 	return "", errors.New("media-type: cannot determine")
 }

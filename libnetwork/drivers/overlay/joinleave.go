@@ -1,44 +1,64 @@
 //go:build linux
-// +build linux
 
 package overlay
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"syscall"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/driverapi"
+	"github.com/docker/docker/libnetwork/internal/netiputil"
+	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/ns"
+	"github.com/docker/docker/libnetwork/osl"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/gogo/protobuf/proto"
-	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Join method is invoked when a Sandbox is attached to an endpoint.
-func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, options map[string]interface{}) error {
+func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, epOpts, _ map[string]interface{}) error {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.drivers.overlay.Join", trace.WithAttributes(
+		attribute.String("nid", nid),
+		attribute.String("eid", eid),
+		attribute.String("sboxKey", sboxKey)))
+	defer span.End()
+
 	if err := validateID(nid, eid); err != nil {
 		return err
 	}
 
-	n := d.network(nid)
-	if n == nil {
-		return fmt.Errorf("could not find network with id %s", nid)
+	n, unlock, err := d.lockNetwork(nid)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 
-	ep := n.endpoint(eid)
+	ep := n.endpoints[eid]
 	if ep == nil {
 		return fmt.Errorf("could not find endpoint with id %s", eid)
 	}
 
-	if n.secure && len(d.keys) == 0 {
-		return fmt.Errorf("cannot join secure network: encryption keys not present")
+	if n.secure {
+		d.encrMu.Lock()
+		nkeys := len(d.keys)
+		d.encrMu.Unlock()
+		if nkeys == 0 {
+			return errors.New("cannot join secure network: encryption keys not present")
+		}
 	}
 
 	nlh := ns.NlHandle()
 
 	if n.secure && !nlh.SupportsNetlinkFamily(syscall.NETLINK_XFRM) {
-		return fmt.Errorf("cannot join secure network: required modules to install IPSEC rules are missing on host")
+		return errors.New("cannot join secure network: required modules to install IPSEC rules are missing on host")
 	}
 
 	s := n.getSubnetforIP(ep.addr)
@@ -49,8 +69,6 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 	if err := n.joinSandbox(s, true); err != nil {
 		return fmt.Errorf("network sandbox join failed: %v", err)
 	}
-
-	sbox := n.sandbox()
 
 	overlayIfName, containerIfName, err := createVethPair()
 	if err != nil {
@@ -66,15 +84,14 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 
 	veth, err := nlh.LinkByName(overlayIfName)
 	if err != nil {
-		return fmt.Errorf("cound not find link by name %s: %v", overlayIfName, err)
+		return fmt.Errorf("could not find link by name %s: %v", overlayIfName, err)
 	}
 	err = nlh.LinkSetMTU(veth, mtu)
 	if err != nil {
 		return err
 	}
 
-	if err = sbox.AddInterface(overlayIfName, "veth",
-		sbox.InterfaceOptions().Master(s.brName)); err != nil {
+	if err = n.sbox.AddInterface(ctx, overlayIfName, "veth", "", osl.WithMaster(s.brName)); err != nil {
 		return fmt.Errorf("could not add veth pair inside the network sandbox: %v", err)
 	}
 
@@ -95,35 +112,33 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 		if sub == s {
 			continue
 		}
-		if err = jinfo.AddStaticRoute(sub.subnetIP, types.NEXTHOP, s.gwIP.IP); err != nil {
-			logrus.Errorf("Adding subnet %s static route in network %q failed\n", s.subnetIP, n.id)
+		if err = jinfo.AddStaticRoute(netiputil.ToIPNet(sub.subnetIP), types.NEXTHOP, s.gwIP.Addr().AsSlice()); err != nil {
+			log.G(ctx).Errorf("Adding subnet %s static route in network %q failed\n", s.subnetIP, n.id)
 		}
 	}
 
 	if iNames := jinfo.InterfaceName(); iNames != nil {
-		err = iNames.SetNames(containerIfName, "eth")
+		err = iNames.SetNames(containerIfName, "eth", netlabel.GetIfname(epOpts))
 		if err != nil {
 			return err
 		}
 	}
 
-	d.peerAdd(nid, eid, ep.addr.IP, ep.addr.Mask, ep.mac, net.ParseIP(d.advertiseAddress), false, false, true)
-
-	if err = d.checkEncryption(nid, nil, true, true); err != nil {
-		logrus.Warn(err)
+	if err := n.peerAdd(eid, ep.addr, ep.mac, netip.Addr{}); err != nil {
+		return fmt.Errorf("overlay: failed to add local endpoint to network peer db: %w", err)
 	}
 
 	buf, err := proto.Marshal(&PeerRecord{
 		EndpointIP:       ep.addr.String(),
 		EndpointMAC:      ep.mac.String(),
-		TunnelEndpointIP: d.advertiseAddress,
+		TunnelEndpointIP: d.advertiseAddress.String(),
 	})
 	if err != nil {
 		return err
 	}
 
 	if err := jinfo.AddTableEntry(ovPeerTable, eid, buf); err != nil {
-		logrus.Errorf("overlay: Failed adding table entry to joininfo: %v", err)
+		log.G(ctx).Errorf("overlay: Failed adding table entry to joininfo: %v", err)
 	}
 
 	return nil
@@ -131,13 +146,13 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 
 func (d *driver) DecodeTableEntry(tablename string, key string, value []byte) (string, map[string]string) {
 	if tablename != ovPeerTable {
-		logrus.Errorf("DecodeTableEntry: unexpected table name %s", tablename)
+		log.G(context.TODO()).Errorf("DecodeTableEntry: unexpected table name %s", tablename)
 		return "", nil
 	}
 
 	var peer PeerRecord
 	if err := proto.Unmarshal(value, &peer); err != nil {
-		logrus.Errorf("DecodeTableEntry: failed to unmarshal peer record for key %s: %v", key, err)
+		log.G(context.TODO()).Errorf("DecodeTableEntry: failed to unmarshal peer record for key %s: %v", key, err)
 		return "", nil
 	}
 
@@ -148,7 +163,7 @@ func (d *driver) DecodeTableEntry(tablename string, key string, value []byte) (s
 
 func (d *driver) EventNotify(etype driverapi.EventType, nid, tableName, key string, value []byte) {
 	if tableName != ovPeerTable {
-		logrus.Errorf("Unexpected table notification for table %s received", tableName)
+		log.G(context.TODO()).Errorf("Unexpected table notification for table %s received", tableName)
 		return
 	}
 
@@ -156,40 +171,60 @@ func (d *driver) EventNotify(etype driverapi.EventType, nid, tableName, key stri
 
 	var peer PeerRecord
 	if err := proto.Unmarshal(value, &peer); err != nil {
-		logrus.Errorf("Failed to unmarshal peer record: %v", err)
+		log.G(context.TODO()).Errorf("Failed to unmarshal peer record: %v", err)
 		return
 	}
 
 	// Ignore local peers. We already know about them and they
 	// should not be added to vxlan fdb.
-	if peer.TunnelEndpointIP == d.advertiseAddress {
+	if addr, _ := netip.ParseAddr(peer.TunnelEndpointIP); addr == d.advertiseAddress {
 		return
 	}
 
-	addr, err := types.ParseCIDR(peer.EndpointIP)
+	addr, err := netip.ParsePrefix(peer.EndpointIP)
 	if err != nil {
-		logrus.Errorf("Invalid peer IP %s received in event notify", peer.EndpointIP)
+		log.G(context.TODO()).WithError(err).Errorf("Invalid peer IP %s received in event notify", peer.EndpointIP)
 		return
 	}
 
 	mac, err := net.ParseMAC(peer.EndpointMAC)
 	if err != nil {
-		logrus.Errorf("Invalid mac %s received in event notify", peer.EndpointMAC)
+		log.G(context.TODO()).WithError(err).Errorf("Invalid mac %s received in event notify", peer.EndpointMAC)
 		return
 	}
 
-	vtep := net.ParseIP(peer.TunnelEndpointIP)
-	if vtep == nil {
-		logrus.Errorf("Invalid VTEP %s received in event notify", peer.TunnelEndpointIP)
+	vtep, err := netip.ParseAddr(peer.TunnelEndpointIP)
+	if err != nil {
+		log.G(context.TODO()).WithError(err).Errorf("Invalid VTEP %s received in event notify", peer.TunnelEndpointIP)
 		return
 	}
 
+	n, unlock, err := d.lockNetwork(nid)
+	if err != nil {
+		log.G(context.TODO()).WithFields(log.Fields{
+			"error": err,
+			"nid":   nid,
+		}).Error("overlay: handling peer event")
+		return
+	}
+	defer unlock()
+
+	var opname string
 	if etype == driverapi.Delete {
-		d.peerDelete(nid, eid, addr.IP, addr.Mask, mac, vtep, false)
-		return
+		opname = "delete"
+		err = n.peerDelete(eid, addr, mac, vtep)
+	} else {
+		opname = "add"
+		err = n.peerAdd(eid, addr, mac, vtep)
 	}
-
-	d.peerAdd(nid, eid, addr.IP, addr.Mask, mac, vtep, false, false, false)
+	if err != nil {
+		log.G(context.TODO()).WithFields(log.Fields{
+			"error": err,
+			"nid":   n.id,
+			"peer":  peer,
+			"op":    opname,
+		}).Warn("Peer operation failed")
+	}
 }
 
 // Leave method is invoked when a Sandbox detaches from an endpoint.
@@ -198,18 +233,21 @@ func (d *driver) Leave(nid, eid string) error {
 		return err
 	}
 
-	n := d.network(nid)
-	if n == nil {
-		return fmt.Errorf("could not find network with id %s", nid)
+	n, unlock, err := d.lockNetwork(nid)
+	if err != nil {
+		return err
 	}
+	defer unlock()
 
-	ep := n.endpoint(eid)
+	ep := n.endpoints[eid]
 
 	if ep == nil {
 		return types.InternalMaskableErrorf("could not find endpoint with id %s", eid)
 	}
 
-	d.peerDelete(nid, eid, ep.addr.IP, ep.addr.Mask, ep.mac, net.ParseIP(d.advertiseAddress), true)
+	if err := n.peerDelete(eid, ep.addr, ep.mac, netip.Addr{}); err != nil {
+		return fmt.Errorf("overlay: failed to delete local endpoint eid:%s from network peer db: %w", eid, err)
+	}
 
 	n.leaveSandbox()
 

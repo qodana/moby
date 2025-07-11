@@ -7,32 +7,36 @@ import (
 	"strings"
 	"sync"
 
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/layer"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/locker"
+	"github.com/moby/sys/user"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
 )
 
-var keyParent = []byte("parent")
-var keyCommitted = []byte("committed")
-var keyIsCommitted = []byte("iscommitted")
-var keyChainID = []byte("chainid")
-var keySize = []byte("size")
+var (
+	keyParent      = []byte("parent")
+	keyCommitted   = []byte("committed")
+	keyIsCommitted = []byte("iscommitted")
+	keyChainID     = []byte("chainid")
+	keySize        = []byte("size")
+)
 
 // Opt defines options for creating the snapshotter
 type Opt struct {
 	GraphDriver     graphdriver.Driver
 	LayerStore      layer.Store
 	Root            string
-	IdentityMapping idtools.IdentityMapping
+	IdentityMapping user.IdentityMapping
 }
 
 type graphIDRegistrar interface {
@@ -42,22 +46,23 @@ type graphIDRegistrar interface {
 }
 
 type checksumCalculator interface {
-	ChecksumForGraphID(id, parent, oldTarDataPath, newTarDataPath string) (diffID layer.DiffID, size int64, err error)
+	ChecksumForGraphID(id, parent, newTarDataPath string) (diffID layer.DiffID, size int64, err error)
 }
 
 type snapshotter struct {
 	opt Opt
 
-	refs map[string]layer.Layer
-	db   *bolt.DB
-	mu   sync.Mutex
-	reg  graphIDRegistrar
+	refs              map[string]layer.Layer
+	db                *bolt.DB
+	mu                sync.Mutex
+	reg               graphIDRegistrar
+	layerCreateLocker *locker.Locker
 }
 
 // NewSnapshotter creates a new snapshotter
-func NewSnapshotter(opt Opt, prevLM leases.Manager) (snapshot.Snapshotter, leases.Manager, error) {
+func NewSnapshotter(opt Opt, prevLM leases.Manager, ns string) (snapshot.Snapshotter, *leaseutil.Manager, error) {
 	dbPath := filepath.Join(opt.Root, "snapshots.db")
-	db, err := bolt.Open(dbPath, 0600, nil)
+	db, err := bolt.Open(dbPath, 0o600, nil)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
 	}
@@ -68,13 +73,15 @@ func NewSnapshotter(opt Opt, prevLM leases.Manager) (snapshot.Snapshotter, lease
 	}
 
 	s := &snapshotter{
-		opt:  opt,
-		db:   db,
-		refs: map[string]layer.Layer{},
-		reg:  reg,
+		opt:               opt,
+		db:                db,
+		refs:              map[string]layer.Layer{},
+		reg:               reg,
+		layerCreateLocker: locker.New(),
 	}
 
-	lm := newLeaseManager(s, prevLM)
+	slm := newLeaseManager(s, prevLM)
+	lm := leaseutil.WithNamespace(slm, ns)
 
 	ll, err := lm.List(context.TODO())
 	if err != nil {
@@ -87,7 +94,7 @@ func NewSnapshotter(opt Opt, prevLM leases.Manager) (snapshot.Snapshotter, lease
 		}
 		for _, r := range rr {
 			if r.Type == "snapshots/default" {
-				lm.addRef(l.ID, r.ID)
+				slm.addRef(l.ID, r.ID)
 			}
 		}
 	}
@@ -99,7 +106,7 @@ func (s *snapshotter) Name() string {
 	return "default"
 }
 
-func (s *snapshotter) IdentityMapping() *idtools.IdentityMapping {
+func (s *snapshotter) IdentityMapping() *user.IdentityMapping {
 	// Returning a non-nil but empty *IdentityMapping breaks BuildKit:
 	// https://github.com/moby/moby/pull/39444
 	if s.opt.IdentityMapping.Empty() {
@@ -140,7 +147,7 @@ func (s *snapshotter) chainID(key string) (layer.ChainID, bool) {
 		if err != nil {
 			return "", false
 		}
-		return layer.ChainID(dgst), true
+		return dgst, true
 	}
 	return "", false
 }
@@ -487,7 +494,7 @@ type mountable struct {
 	acquire  func() ([]mount.Mount, func() error, error)
 	release  func() error
 	refCount int
-	idmap    idtools.IdentityMapping
+	idmap    user.IdentityMapping
 }
 
 func (m *mountable) Mount() ([]mount.Mount, func() error, error) {
@@ -531,7 +538,7 @@ func (m *mountable) releaseMount() error {
 	return m.release()
 }
 
-func (m *mountable) IdentityMapping() *idtools.IdentityMapping {
+func (m *mountable) IdentityMapping() *user.IdentityMapping {
 	// Returning a non-nil but empty *IdentityMapping breaks BuildKit:
 	// https://github.com/moby/moby/pull/39444
 	if m.idmap.Empty() {

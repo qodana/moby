@@ -2,31 +2,36 @@ package build
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/build"
+	containertypes "github.com/docker/docker/api/types/container"
 	dclient "github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/daemon"
 	"github.com/docker/docker/testutil/fakecontext"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
 func TestBuildSquashParent(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+	skip.If(t, testEnv.UsingSnapshotter(), "squash is not implemented for containerd image store")
+
+	ctx := testutil.StartSpan(baseContext, t)
 
 	var client dclient.APIClient
 	if !testEnv.DaemonInfo.ExperimentalBuild {
 		skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 
 		d := daemon.New(t, daemon.WithExperimental())
-		d.StartWithBusybox(t)
+		d.StartWithBusybox(ctx, t)
 		defer d.Stop(t)
 		client = d.NewClientT(t)
 	} else {
@@ -43,14 +48,13 @@ func TestBuildSquashParent(t *testing.T) {
 		`
 
 	// build and get the ID that we can use later for history comparison
-	ctx := context.Background()
 	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
 	defer source.Close()
 
 	name := strings.ToLower(t.Name())
 	resp, err := client.ImageBuild(ctx,
 		source.AsTarReader(t),
-		types.ImageBuildOptions{
+		build.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
 			Tags:        []string{name},
@@ -60,14 +64,14 @@ func TestBuildSquashParent(t *testing.T) {
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	inspect, _, err := client.ImageInspectWithRaw(ctx, name)
+	inspect, err := client.ImageInspect(ctx, name)
 	assert.NilError(t, err)
 	origID := inspect.ID
 
 	// build with squash
 	resp, err = client.ImageBuild(ctx,
 		source.AsTarReader(t),
-		types.ImageBuildOptions{
+		build.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
 			Squash:      true,
@@ -82,7 +86,9 @@ func TestBuildSquashParent(t *testing.T) {
 		container.WithImage(name),
 		container.WithCmd("/bin/sh", "-c", "cat /hello"),
 	)
-	reader, err := client.ContainerLogs(ctx, cid, types.ContainerLogsOptions{
+
+	poll.WaitOn(t, container.IsStopped(ctx, client, cid))
+	reader, err := client.ContainerLogs(ctx, cid, containertypes.LogsOptions{
 		ShowStdout: true,
 	})
 	assert.NilError(t, err)
@@ -107,7 +113,7 @@ func TestBuildSquashParent(t *testing.T) {
 	testHistory, err := client.ImageHistory(ctx, name)
 	assert.NilError(t, err)
 
-	inspect, _, err = client.ImageInspectWithRaw(ctx, name)
+	inspect, err = client.ImageInspect(ctx, name)
 	assert.NilError(t, err)
 	assert.Check(t, is.Len(testHistory, len(origHistory)+1))
 	assert.Check(t, is.Len(inspect.RootFS.Layers, 2))

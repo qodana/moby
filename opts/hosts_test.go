@@ -1,4 +1,4 @@
-package opts // import "github.com/docker/docker/opts"
+package opts
 
 import (
 	"fmt"
@@ -77,7 +77,7 @@ func TestParseDockerDaemonHost(t *testing.T) {
 		"udp://127.0.0.1":               "invalid bind address (udp://127.0.0.1): unsupported proto 'udp'",
 		"udp://127.0.0.1:5555":          "invalid bind address (udp://127.0.0.1:5555): unsupported proto 'udp'",
 		"tcp://unix:///run/docker.sock": "invalid bind address (tcp://unix:///run/docker.sock): should not contain a path element",
-		" tcp://:5555/path ":            "invalid bind address ( tcp://:5555/path ): unsupported proto ' tcp'",
+		" tcp://:5555/path ":            "invalid bind address ( tcp://:5555/path ): unsupported proto ' tcp'", //nolint:gocritic // This is a valid test case.
 		"":                              "invalid bind address (): unsupported proto ''",
 		":5555/path":                    "invalid bind address (:5555/path): should not contain a path element",
 		"0.0.0.1:5555/path":             "invalid bind address (0.0.0.1:5555/path): should not contain a path element",
@@ -107,7 +107,7 @@ func TestParseDockerDaemonHost(t *testing.T) {
 		"npipe://":                "npipe://" + DefaultNamedPipe,
 		"npipe:////./pipe/foo":    "npipe:////./pipe/foo",
 		"tcp://":                  DefaultTCPHost,
-		"tcp://:5555":             fmt.Sprintf("tcp://%s:5555", DefaultHTTPHost),
+		"tcp://:5555":             fmt.Sprintf("tcp://%s:5555", DefaultHTTPHost), //nolint:nosprintfhostport // sprintf is more readable for this case.
 		"tcp://[::1]":             fmt.Sprintf("tcp://[::1]:%d", DefaultHTTPPort),
 		"tcp://[::1]:":            fmt.Sprintf("tcp://[::1]:%d", DefaultHTTPPort),
 		"tcp://[::1]:5555":        "tcp://[::1]:5555",
@@ -139,9 +139,7 @@ func TestParseDockerDaemonHost(t *testing.T) {
 }
 
 func TestParseTCP(t *testing.T) {
-	var (
-		defaultHTTPHost = "tcp://127.0.0.1:8888"
-	)
+	defaultHTTPHost := "tcp://127.0.0.1:8888"
 	invalids := map[string]string{
 		"tcp:a.b.c.d":                 `invalid bind address (tcp:a.b.c.d): parse "tcp://tcp:a.b.c.d": invalid port ":a.b.c.d" after host`,
 		"tcp:a.b.c.d/path":            `invalid bind address (tcp:a.b.c.d/path): parse "tcp://tcp:a.b.c.d/path": invalid port ":a.b.c.d" after host`,

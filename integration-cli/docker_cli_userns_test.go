@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -15,7 +14,9 @@ import (
 	"testing"
 
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/testutil"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 // user namespaces test: run daemon with remapped root setting
@@ -24,7 +25,12 @@ import (
 func (s *DockerDaemonSuite) TestDaemonUserNamespaceRootSetting(c *testing.T) {
 	testRequires(c, UserNamespaceInKernel)
 
-	s.d.StartWithBusybox(c, "--userns-remap", "default")
+	ctx := testutil.GetContext(c)
+	s.d.StartWithBusybox(ctx, c, "--userns-remap", "default")
+
+	out, err := s.d.Cmd("run", "busybox", "stat", "-c", "%u:%g", "/bin/cat")
+	assert.Check(c, err)
+	assert.Assert(c, is.Equal(strings.TrimSpace(out), "0:0"))
 
 	tmpDir, err := os.MkdirTemp("", "userns")
 	assert.NilError(c, err)
@@ -46,7 +52,7 @@ func (s *DockerDaemonSuite) TestDaemonUserNamespaceRootSetting(c *testing.T) {
 	// writable by the remapped root UID/GID pair
 	assert.NilError(c, os.Chown(tmpDir, uid, gid))
 
-	out, err := s.d.Cmd("run", "-d", "--name", "userns", "-v", tmpDir+":/goofy", "-v", tmpDirNotExists+":/donald", "busybox", "sh", "-c", "touch /goofy/testfile; exec top")
+	out, err = s.d.Cmd("run", "-d", "--name", "userns", "-v", tmpDir+":/goofy", "-v", tmpDirNotExists+":/donald", "busybox", "sh", "-c", "touch /goofy/testfile; exec top")
 	assert.NilError(c, err, "Output: %s", out)
 
 	user := s.findUser(c, "userns")
@@ -89,13 +95,13 @@ func (s *DockerDaemonSuite) TestDaemonUserNamespaceRootSetting(c *testing.T) {
 }
 
 // findUser finds the uid or name of the user of the first process that runs in a container
-func (s *DockerDaemonSuite) findUser(c *testing.T, container string) string {
+func (s *DockerDaemonSuite) findUser(t *testing.T, container string) string {
 	out, err := s.d.Cmd("top", container)
-	assert.Assert(c, err == nil, "Output: %s", out)
+	assert.Assert(t, err == nil, "Output: %s", out)
 	rows := strings.Split(out, "\n")
 	if len(rows) < 2 {
 		// No process rows founds
-		c.FailNow()
+		t.FailNow()
 	}
 	return strings.Fields(rows[1])[0]
 }

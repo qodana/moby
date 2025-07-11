@@ -1,7 +1,6 @@
 //go:build linux
-// +build linux
 
-package overlay2 // import "github.com/docker/docker/daemon/graphdriver/overlay2"
+package overlay2
 
 import (
 	"os"
@@ -9,8 +8,7 @@ import (
 
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/daemon/graphdriver/graphtest"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/reexec"
+	"github.com/moby/go-archive"
 )
 
 func init() {
@@ -18,8 +16,6 @@ func init() {
 	// errors or hangs to be debugged directly from the test process.
 	untar = archive.UntarUncompressed
 	graphdriver.ApplyUncompressedLayer = archive.ApplyUncompressedLayer
-
-	reexec.Init()
 }
 
 func skipIfNaive(t *testing.T) {

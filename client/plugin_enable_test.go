@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestPluginEnableError(t *testing.T) {
@@ -19,9 +21,15 @@ func TestPluginEnableError(t *testing.T) {
 	}
 
 	err := client.PluginEnable(context.Background(), "plugin_name", types.PluginEnableOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	err = client.PluginEnable(context.Background(), "", types.PluginEnableOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	err = client.PluginEnable(context.Background(), "    ", types.PluginEnableOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestPluginEnable(t *testing.T) {
@@ -43,7 +51,5 @@ func TestPluginEnable(t *testing.T) {
 	}
 
 	err := client.PluginEnable(context.Background(), "plugin_name", types.PluginEnableOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 }

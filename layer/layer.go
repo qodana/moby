@@ -7,16 +7,18 @@
 // read-only and writable layers. The exported
 // tar data for a read-only layer should match
 // the tar used to create the layer.
-package layer // import "github.com/docker/docker/layer"
+package layer
 
 import (
+	"context"
 	"errors"
 	"io"
 
+	"github.com/containerd/log"
 	"github.com/docker/distribution"
-	"github.com/docker/docker/pkg/archive"
+	"github.com/moby/go-archive"
 	"github.com/opencontainers/go-digest"
-	"github.com/sirupsen/logrus"
+	"github.com/opencontainers/image-spec/identity"
 )
 
 var (
@@ -44,20 +46,10 @@ var (
 )
 
 // ChainID is the content-addressable ID of a layer.
-type ChainID digest.Digest
-
-// String returns a string rendition of a layer ID
-func (id ChainID) String() string {
-	return string(id)
-}
+type ChainID = digest.Digest
 
 // DiffID is the hash of an individual layer tar.
-type DiffID digest.Digest
-
-// String returns a string rendition of a layer DiffID
-func (diffID DiffID) String() string {
-	return string(diffID)
-}
+type DiffID = digest.Digest
 
 // TarStreamer represents an object which may
 // have its contents exported as a tar stream.
@@ -173,12 +165,10 @@ type Store interface {
 	Get(ChainID) (Layer, error)
 	Map() map[ChainID]Layer
 	Release(Layer) ([]Metadata, error)
-
 	CreateRWLayer(id string, parent ChainID, opts *CreateRWLayerOpts) (RWLayer, error)
 	GetRWLayer(id string) (RWLayer, error)
 	GetMountID(id string) (string, error)
 	ReleaseRWLayer(RWLayer) ([]Metadata, error)
-
 	Cleanup() error
 	DriverStatus() [][2]string
 	DriverName() string
@@ -190,21 +180,11 @@ type DescribableStore interface {
 	RegisterWithDescriptor(io.Reader, ChainID, distribution.Descriptor) (Layer, error)
 }
 
-// CreateChainID returns ID for a layerDigest slice
+// CreateChainID returns ID for a layerDigest slice.
+//
+// Deprecated: use [identity.ChainID].
 func CreateChainID(dgsts []DiffID) ChainID {
-	return createChainIDFromParent("", dgsts...)
-}
-
-func createChainIDFromParent(parent ChainID, dgsts ...DiffID) ChainID {
-	if len(dgsts) == 0 {
-		return parent
-	}
-	if parent == "" {
-		return createChainIDFromParent(ChainID(dgsts[0]), dgsts[1:]...)
-	}
-	// H = "H(n-1) SHA256(n)"
-	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0])))
-	return createChainIDFromParent(ChainID(dgst), dgsts[1:]...)
+	return identity.ChainID(dgsts)
 }
 
 // ReleaseAndLog releases the provided layer from the given layer
@@ -212,15 +192,9 @@ func createChainIDFromParent(parent ChainID, dgsts ...DiffID) ChainID {
 func ReleaseAndLog(ls Store, l Layer) {
 	metadata, err := ls.Release(l)
 	if err != nil {
-		logrus.Errorf("Error releasing layer %s: %v", l.ChainID(), err)
+		log.G(context.TODO()).Errorf("Error releasing layer %s: %v", l.ChainID(), err)
 	}
-	LogReleaseMetadata(metadata)
-}
-
-// LogReleaseMetadata logs a metadata array, uses this to
-// ensure consistent logging for release metadata
-func LogReleaseMetadata(metadatas []Metadata) {
-	for _, metadata := range metadatas {
-		logrus.Infof("Layer %s cleaned up", metadata.ChainID)
+	for _, m := range metadata {
+		log.G(context.TODO()).WithField("chainID", m.ChainID).Infof("Cleaned up layer %s", m.ChainID)
 	}
 }

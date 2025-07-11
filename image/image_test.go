@@ -1,4 +1,4 @@
-package image // import "github.com/docker/docker/image"
+package image
 
 import (
 	"encoding/json"
@@ -56,29 +56,6 @@ func TestMarshalKeyOrder(t *testing.T) {
 	}
 }
 
-const sampleHistoryJSON = `{
-	"created": "2021-01-13T09:35:56Z",
-	"created_by": "image_test.go"
-}`
-
-func TestHistoryEqual(t *testing.T) {
-	h := historyFromJSON(t, sampleHistoryJSON)
-	hCopy := h
-	assert.Check(t, h.Equal(hCopy))
-
-	hUTC := historyFromJSON(t, `{"created": "2021-01-13T14:00:00Z"}`)
-	hOffset0 := historyFromJSON(t, `{"created": "2021-01-13T14:00:00+00:00"}`)
-	assert.Check(t, hUTC.Created != hOffset0.Created)
-	assert.Check(t, hUTC.Equal(hOffset0))
-}
-
-func historyFromJSON(t *testing.T, historyJSON string) History {
-	var h History
-	err := json.Unmarshal([]byte(historyJSON), &h)
-	assert.Check(t, err)
-	return h
-}
-
 func TestImage(t *testing.T) {
 	cid := "50a16564e727"
 	config := &container.Config{
@@ -114,7 +91,7 @@ func TestImageOSNotEmpty(t *testing.T) {
 
 func TestNewChildImageFromImageWithRootFS(t *testing.T) {
 	rootFS := NewRootFS()
-	rootFS.Append(layer.DiffID("ba5e"))
+	rootFS.Append("ba5e")
 	parent := &Image{
 		RootFS: rootFS,
 		History: []History{
@@ -132,7 +109,7 @@ func TestNewChildImageFromImageWithRootFS(t *testing.T) {
 	}
 
 	newImage := NewChildImage(parent, childConfig, "platform")
-	expectedDiffIDs := []layer.DiffID{layer.DiffID("ba5e"), layer.DiffID("abcdef")}
+	expectedDiffIDs := []layer.DiffID{"ba5e", "abcdef"}
 	assert.Check(t, is.DeepEqual(expectedDiffIDs, newImage.RootFS.DiffIDs))
 	assert.Check(t, is.Equal(childConfig.Author, newImage.Author))
 	assert.Check(t, is.DeepEqual(childConfig.Config, newImage.Config))

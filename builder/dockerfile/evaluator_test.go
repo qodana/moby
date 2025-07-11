@@ -1,4 +1,4 @@
-package dockerfile // import "github.com/docker/docker/builder/dockerfile"
+package dockerfile
 
 import (
 	"context"
@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/docker/docker/builder/remotecontext"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/go-archive"
+	"github.com/moby/sys/reexec"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -21,8 +21,11 @@ type dispatchTestCase struct {
 	files               map[string]string
 }
 
-func init() {
-	reexec.Init()
+func TestMain(m *testing.M) {
+	if reexec.Init() {
+		return
+	}
+	os.Exit(m.Run())
 }
 
 func TestDispatch(t *testing.T) {
@@ -97,15 +100,13 @@ func TestDispatch(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			contextDir, cleanup := createTestTempDir(t, "", "builder-dockerfile-test")
-			defer cleanup()
+			contextDir := t.TempDir()
 
 			for filename, content := range tc.files {
-				createTestTempFile(t, contextDir, filename, content, 0777)
+				createTestTempFile(t, contextDir, filename, content, 0o777)
 			}
 
 			tarStream, err := archive.Tar(contextDir, archive.Uncompressed)
-
 			if err != nil {
 				t.Fatalf("Error when creating tar stream: %s", err)
 			}
@@ -117,7 +118,6 @@ func TestDispatch(t *testing.T) {
 			}()
 
 			buildContext, err := remotecontext.FromArchive(tarStream)
-
 			if err != nil {
 				t.Fatalf("Error when creating tar context: %s", err)
 			}

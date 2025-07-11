@@ -6,26 +6,32 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	containerdimages "github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	containerdlabels "github.com/containerd/containerd/v2/pkg/labels"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/auxprogress"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/daemon/internal/metrics"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 )
 
-// PushImage initiates a push operation of the image pointed to by targetRef.
+// PushImage initiates a push operation of the image pointed to by sourceRef.
+// If reference is untagged, all tags from the reference repository are pushed.
 // Image manifest (or index) is pushed as is, which will probably fail if you
 // don't have all content referenced by the index.
 // Cross-repo mounts will be attempted for non-existing blobs.
@@ -34,51 +40,102 @@ import (
 // pointing to the new target repository. This will allow subsequent pushes
 // to perform cross-repo mounts of the shared content when pushing to a different
 // repository on the same registry.
-func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) error {
-	if _, tagged := targetRef.(reference.Tagged); !tagged {
-		if _, digested := targetRef.(reference.Digested); !digested {
-			return errdefs.NotImplemented(errors.New("push all tags is not implemented"))
+func (i *ImageService) PushImage(ctx context.Context, sourceRef reference.Named, platform *ocispec.Platform, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) (retErr error) {
+	start := time.Now()
+	defer func() {
+		if retErr == nil {
+			metrics.ImageActions.WithValues("push").UpdateSince(start)
+		}
+	}()
+	out := streamformatter.NewJSONProgressOutput(outStream, false)
+	progress.Messagef(out, "", "The push refers to repository [%s]", sourceRef.Name())
+
+	if _, tagged := sourceRef.(reference.Tagged); !tagged {
+		if _, digested := sourceRef.(reference.Digested); !digested {
+			// Image is not tagged nor digested, that means all tags push was requested.
+
+			// Find all images with the same repository.
+			imgs, err := i.getAllImagesWithRepository(ctx, sourceRef)
+			if err != nil {
+				return err
+			}
+
+			if len(imgs) == 0 {
+				return fmt.Errorf("An image does not exist locally with the tag: %s", reference.FamiliarName(sourceRef))
+			}
+
+			for _, img := range imgs {
+				named, err := reference.ParseNamed(img.Name)
+				if err != nil {
+					// This shouldn't happen, but log a warning just in case.
+					log.G(ctx).WithFields(log.Fields{
+						"image":     img.Name,
+						"sourceRef": sourceRef,
+					}).Warn("refusing to push an invalid tag")
+					continue
+				}
+
+				if err := i.pushRef(ctx, named, platform, metaHeaders, authConfig, out); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		}
 	}
 
+	return i.pushRef(ctx, sourceRef, platform, metaHeaders, authConfig, out)
+}
+
+func (i *ImageService) pushRef(ctx context.Context, targetRef reference.Named, platform *ocispec.Platform, metaHeaders map[string][]string, authConfig *registry.AuthConfig, out progress.Output) (retErr error) {
 	leasedCtx, release, err := i.client.WithLease(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		err := release(leasedCtx)
-		if err != nil && !cerrdefs.IsNotFound(err) {
-			logrus.WithField("image", targetRef).WithError(err).Error("failed to delete lease created for push")
+		if err := release(context.WithoutCancel(leasedCtx)); err != nil {
+			log.G(ctx).WithField("image", targetRef).WithError(err).Warn("failed to release lease created for push")
 		}
 	}()
 
-	out := streamformatter.NewJSONProgressOutput(outStream, false)
-
-	img, err := i.client.ImageService().Get(ctx, targetRef.String())
+	img, err := i.images.Get(ctx, targetRef.String())
 	if err != nil {
-		return errdefs.NotFound(err)
+		if cerrdefs.IsNotFound(err) {
+			return errdefs.NotFound(fmt.Errorf("tag does not exist: %s", reference.FamiliarString(targetRef)))
+		}
+		return errdefs.System(err)
 	}
 
 	target := img.Target
-	store := i.client.ContentStore()
+	if platform != nil {
+		target, err = i.getPushDescriptor(ctx, img, platform)
+		if err != nil {
+			return err
+		}
+	}
 
-	resolver, tracker := i.newResolverFromAuthConfig(authConfig)
-	progress := pushProgress{Tracker: tracker}
+	store := i.content
+	resolver, tracker := i.newResolverFromAuthConfig(ctx, authConfig, targetRef)
+	pp := pushProgress{Tracker: tracker}
 	jobsQueue := newJobs()
 	finishProgress := jobsQueue.showProgress(ctx, out, combinedProgress([]progressUpdater{
-		&progress,
-		pullProgress{ShowExists: false, Store: store},
+		&pp,
+		&pullProgress{showExists: false, store: store},
 	}))
-	defer finishProgress()
+	defer func() {
+		finishProgress()
+		if retErr == nil {
+			if tagged, ok := targetRef.(reference.Tagged); ok {
+				progress.Messagef(out, "", "%s: digest: %s size: %d", tagged.Tag(), target.Digest, target.Size)
+			}
+		}
+	}()
 
-	var limiter *semaphore.Weighted = nil // TODO: Respect max concurrent downloads/uploads
+	var limiter *semaphore.Weighted // TODO: Respect max concurrent downloads/uploads
 
 	mountableBlobs, err := findMissingMountable(ctx, store, jobsQueue, target, targetRef, limiter)
 	if err != nil {
 		return err
-	}
-	for dgst := range mountableBlobs {
-		progress.addMountable(dgst)
 	}
 
 	// Create a store which fakes the local existence of possibly mountable blobs.
@@ -86,61 +143,184 @@ func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named,
 	realStore := store
 	wrapped := wrapWithFakeMountableBlobs(store, mountableBlobs)
 	store = wrapped
-
-	pusher, err := resolver.Pusher(ctx, targetRef.String())
-	if err != nil {
-		return err
-	}
-
-	addChildrenToJobs := containerdimages.HandlerFunc(
-		func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-			children, err := containerdimages.Children(ctx, store, desc)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range children {
-				jobsQueue.Add(c)
-			}
-
+	addLayerJobs := c8dimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		if showBlobProgress(desc) {
 			jobsQueue.Add(desc)
+		}
 
-			return nil, nil
-		},
-	)
+		return nil, nil
+	})
 
-	handlerWrapper := func(h images.Handler) images.Handler {
-		return containerdimages.Handlers(addChildrenToJobs, h)
+	handlerWrapper := func(h c8dimages.Handler) c8dimages.Handler {
+		return c8dimages.Handlers(addLayerJobs, h)
 	}
 
-	err = remotes.PushContent(ctx, pusher, target, store, limiter, platforms.All, handlerWrapper)
-	if err != nil {
-		if containerdimages.IsIndexType(target.MediaType) {
-			if cerrdefs.IsNotFound(err) {
-				err = errdefs.NotFound(fmt.Errorf(
-					"missing content: %w\n"+
-						"Note: You're trying to push a manifest list/index which "+
-						"references multiple platform specific manifests, but not all of them are available locally "+
-						"or available to the remote repository.\n"+
-						"Make sure you have all the referenced content and try again.",
-					err))
+	push := func(ctx context.Context, desc ocispec.Descriptor) error {
+		ref := targetRef
+
+		if _, digested := ref.(reference.Digested); !digested {
+			// Annotate ref with digest to push only push tag for single digest
+			ref, err = reference.WithDigest(ref, target.Digest)
+			if err != nil {
+				return err
 			}
 		}
-	} else {
-		appendSource, err := docker.AppendDistributionSourceLabel(realStore, targetRef.String())
+		pusher, err := resolver.Pusher(ctx, ref.String())
 		if err != nil {
-			// This shouldn't happen at this point because the reference would have to be invalid
-			// and if it was, then it would error out earlier.
-			return errdefs.Unknown(errors.Wrap(err, "failed to create an handler that appends distribution source label to pushed content"))
+			return err
 		}
 
-		if err := containerdimages.Dispatch(ctx, appendSource, nil, target); err != nil {
-			// Shouldn't happen, but even if it would fail, then make it only a warning
-			// because it doesn't affect the pushed data.
-			logrus.WithError(err).Warn("failed to append distribution source labels to pushed content")
+		return remotes.PushContent(ctx, pusher, desc, store, limiter, platforms.All, handlerWrapper)
+	}
+
+	err = push(ctx, target)
+	if err != nil {
+		// If push failed because of a missing content, no specific platform was requested
+		// and the target is an index, select a platform-specific manifest to push instead.
+		if cerrdefs.IsNotFound(err) && c8dimages.IsIndexType(target.MediaType) && platform == nil {
+			var newTarget ocispec.Descriptor
+			newTarget, err = i.getPushDescriptor(ctx, img, nil)
+			if err != nil {
+				return err
+			}
+
+			// Retry only if the new push candidate is different from the previous one.
+			if newTarget.Digest != target.Digest {
+				orgTarget := target
+				target = newTarget
+				pp.TurnNotStartedIntoUnavailable()
+				err = push(ctx, target)
+
+				if err == nil {
+					progress.Aux(out, auxprogress.ManifestPushedInsteadOfIndex{
+						ManifestPushedInsteadOfIndex: true,
+						OriginalIndex:                orgTarget,
+						SelectedManifest:             newTarget,
+					})
+				}
+			}
+		}
+
+		if err != nil {
+			if !cerrdefs.IsNotFound(err) {
+				return translateRegistryError(ctx, err)
+			}
+			progress.Aux(out, auxprogress.ContentMissing{
+				ContentMissing: true,
+				Desc:           target,
+			})
+			return errdefs.NotFound(err)
 		}
 	}
 
-	return err
+	appendDistributionSourceLabel(ctx, realStore, targetRef, target)
+
+	i.LogImageEvent(ctx, reference.FamiliarString(targetRef), reference.FamiliarName(targetRef), events.ActionPush)
+
+	return nil
+}
+
+func (i *ImageService) getPushDescriptor(ctx context.Context, img c8dimages.Image, platform *ocispec.Platform) (ocispec.Descriptor, error) {
+	pm := i.matchRequestedOrDefault(platforms.OnlyStrict, platform)
+
+	anyMissing := false
+
+	var bestMatchPlatform ocispec.Platform
+	var bestMatch *ImageManifest
+	var presentMatchingManifests []*ImageManifest
+	err := i.walkReachableImageManifests(ctx, img, func(im *ImageManifest) error {
+		available, err := im.CheckContentAvailable(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to determine availability of image manifest %s: %w", im.Target().Digest, err)
+		}
+
+		if !available {
+			anyMissing = true
+			return nil
+		}
+
+		if im.IsAttestation() {
+			return nil
+		}
+
+		imgPlatform, err := im.ImagePlatform(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to determine platform of image %s: %w", img.Name, err)
+		}
+
+		if !pm.Match(imgPlatform) {
+			return nil
+		}
+
+		presentMatchingManifests = append(presentMatchingManifests, im)
+		if bestMatch == nil || pm.Less(imgPlatform, bestMatchPlatform) {
+			bestMatchPlatform = imgPlatform
+			bestMatch = im
+		}
+
+		return nil
+	})
+	if err != nil {
+		return ocispec.Descriptor{}, errdefs.System(err)
+	}
+
+	switch len(presentMatchingManifests) {
+	case 0:
+		err := &errPlatformNotFound{imageRef: imageFamiliarName(img)}
+		if pm.Requested != nil {
+			err.wanted = *pm.Requested
+		}
+		return ocispec.Descriptor{}, err
+	case 1:
+		// Only one manifest is available AND matching the requested platform.
+
+		if platform != nil {
+			// Explicit platform was requested
+			return presentMatchingManifests[0].Target(), nil
+		}
+
+		// No specific platform was requested, but only one manifest is available.
+		if anyMissing {
+			return presentMatchingManifests[0].Target(), nil
+		}
+
+		// Index has only one manifest anyway, select the full index.
+		return img.Target, nil
+	default:
+		if platform == nil {
+			if !anyMissing {
+				// No specific platform requested, and all manifests are available, select the full index.
+				return img.Target, nil
+			}
+
+			// No specific platform requested and not all manifests are available.
+			// Select the manifest that matches the host platform the best.
+			if bestMatch != nil && i.hostPlatformMatcher().Match(bestMatchPlatform) {
+				return bestMatch.Target(), nil
+			}
+
+			return ocispec.Descriptor{}, errdefs.Conflict(errors.Errorf("multiple matching manifests found but no specific platform requested"))
+		}
+
+		return ocispec.Descriptor{}, errdefs.Conflict(errors.Errorf("multiple manifests found for platform %s", platforms.FormatAll(*platform)))
+	}
+}
+
+func appendDistributionSourceLabel(ctx context.Context, realStore content.Store, targetRef reference.Named, target ocispec.Descriptor) {
+	appendSource, err := docker.AppendDistributionSourceLabel(realStore, targetRef.String())
+	if err != nil {
+		// This shouldn't happen at this point because the reference would have to be invalid
+		// and if it was, then it would error out earlier.
+		log.G(ctx).WithError(err).Warn("failed to create an handler that appends distribution source label to pushed content")
+		return
+	}
+
+	handler := presentChildrenHandler(realStore, appendSource)
+	if err := c8dimages.Dispatch(ctx, handler, nil, target); err != nil {
+		// Shouldn't happen, but even if it would fail, then make it only a warning
+		// because it doesn't affect the pushed data.
+		log.G(ctx).WithError(err).Warn("failed to append distribution source labels to pushed content")
+	}
 }
 
 // findMissingMountable will walk the target descriptor recursively and return
@@ -154,10 +334,10 @@ func findMissingMountable(ctx context.Context, store content.Store, queue *jobs,
 
 	sources, err := getDigestSources(ctx, store, target.Digest)
 	if err != nil {
-		if !errdefs.IsNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return nil, err
 		}
-		logrus.WithField("target", target).Debug("distribution source label not found")
+		log.G(ctx).WithField("target", target).Debug("distribution source label not found")
 		return mountableBlobs, nil
 	}
 
@@ -180,10 +360,10 @@ func findMissingMountable(ctx context.Context, store content.Store, queue *jobs,
 			return nil, nil
 		}
 
-		return containerdimages.Children(ctx, store, desc)
+		return c8dimages.Children(ctx, store, desc)
 	}
 
-	err = containerdimages.Dispatch(ctx, containerdimages.HandlerFunc(handler), limiter, target)
+	err = c8dimages.Dispatch(ctx, c8dimages.HandlerFunc(handler), limiter, target)
 	if err != nil {
 		return nil, err
 	}
@@ -202,15 +382,11 @@ func getDigestSources(ctx context.Context, store content.Manager, digest digest.
 
 	sources := extractDistributionSources(info.Labels)
 	if sources == nil {
-		return nil, errdefs.NotFound(fmt.Errorf("label %q is not attached to %s", labelDistributionSource, digest.String()))
+		return nil, errdefs.NotFound(fmt.Errorf("label %q is not attached to %s", containerdlabels.LabelDistributionSource, digest.String()))
 	}
 
 	return sources, nil
 }
-
-// TODO(vvoland): Remove and use containerd const in containerd 1.7+
-// https://github.com/containerd/containerd/pull/8224
-const labelDistributionSource = "containerd.io/distribution.source."
 
 func extractDistributionSources(labels map[string]string) []distributionSource {
 	var sources []distributionSource
@@ -218,7 +394,7 @@ func extractDistributionSources(labels map[string]string) []distributionSource {
 	// Check if this blob has a distributionSource label
 	// if yes, read it as source
 	for k, v := range labels {
-		if reg := strings.TrimPrefix(k, labelDistributionSource); reg != k {
+		if reg := strings.TrimPrefix(k, containerdlabels.LabelDistributionSource); reg != k {
 			for _, repo := range strings.Split(v, ",") {
 				ref, err := reference.ParseNamed(reg + "/" + repo)
 				if err != nil {
@@ -243,7 +419,7 @@ type distributionSource struct {
 func (source distributionSource) ToAnnotation() (string, string) {
 	domain := reference.Domain(source.registryRef)
 	v := reference.Path(source.registryRef)
-	return labelDistributionSource + domain, v
+	return containerdlabels.LabelDistributionSource + domain, v
 }
 
 func (source distributionSource) GetReference(dgst digest.Digest) (reference.Named, error) {
@@ -253,10 +429,10 @@ func (source distributionSource) GetReference(dgst digest.Digest) (reference.Nam
 // canBeMounted returns if the content with given media type can be cross-repo
 // mounted when pushing it to a remote reference ref.
 func canBeMounted(mediaType string, targetRef reference.Named, source distributionSource) bool {
-	if containerdimages.IsManifestType(mediaType) {
+	if c8dimages.IsManifestType(mediaType) {
 		return false
 	}
-	if containerdimages.IsIndexType(mediaType) {
+	if c8dimages.IsIndexType(mediaType) {
 		return false
 	}
 

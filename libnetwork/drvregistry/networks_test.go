@@ -4,9 +4,28 @@ import (
 	"testing"
 
 	"github.com/docker/docker/libnetwork/driverapi"
+	"github.com/docker/docker/libnetwork/scope"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
+
+const mockDriverName = "mock-driver"
+
+type mockDriver struct {
+	driverapi.Driver
+}
+
+var mockDriverCaps = driverapi.Capability{DataScope: scope.Local}
+
+var md = mockDriver{}
+
+func (m *mockDriver) Type() string {
+	return mockDriverName
+}
+
+func (m *mockDriver) IsBuiltIn() bool {
+	return true
+}
 
 func TestNetworks(t *testing.T) {
 	t.Run("RegisterDriver", func(t *testing.T) {
@@ -30,9 +49,9 @@ func TestNetworks(t *testing.T) {
 		err := reg.RegisterDriver(mockDriverName, &md, mockDriverCaps)
 		assert.NilError(t, err)
 
-		d, cap := reg.Driver(mockDriverName)
-		assert.Check(t, d != nil)
-		assert.Check(t, is.DeepEqual(cap, mockDriverCaps))
+		driver, capability := reg.Driver(mockDriverName)
+		assert.Check(t, driver != nil)
+		assert.Check(t, is.DeepEqual(capability, mockDriverCaps))
 	})
 
 	t.Run("WalkDrivers", func(t *testing.T) {

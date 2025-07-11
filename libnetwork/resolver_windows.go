@@ -1,8 +1,9 @@
 //go:build windows
-// +build windows
 
 package libnetwork
 
-func (r *Resolver) setupIPTable() error {
+import "context"
+
+func (r *Resolver) setupNAT(context.Context) error {
 	return nil
 }

@@ -1,6 +1,7 @@
-package dockerfile // import "github.com/docker/docker/builder/dockerfile"
+package dockerfile
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"mime"
@@ -8,23 +9,23 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/remotecontext"
 	"github.com/docker/docker/builder/remotecontext/urlutil"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/longpath"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/system"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/go-archive"
+	"github.com/moby/sys/symlink"
+	"github.com/moby/sys/user"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -45,7 +46,7 @@ type copyInfo struct {
 }
 
 func (c copyInfo) fullPath() (string, error) {
-	return containerfs.ResolveScopedPath(c.root, c.path)
+	return symlink.FollowSymlinkInScope(filepath.Join(c.root, c.path), c.root)
 }
 
 func newCopyInfoFromSource(source builder.Source, path string, hash string) copyInfo {
@@ -74,7 +75,7 @@ type copier struct {
 	source      builder.Source
 	pathCache   pathCache
 	download    sourceDownloader
-	platform    *specs.Platform
+	platform    ocispec.Platform
 	// for cleanup. TODO: having copier.cleanup() is error prone and hard to
 	// follow. Code calling performCopy should manage the lifecycle of its params.
 	// Copier should take override source as input, not imageMount.
@@ -83,19 +84,7 @@ type copier struct {
 }
 
 func copierFromDispatchRequest(req dispatchRequest, download sourceDownloader, imageSource *imageMount) copier {
-	platform := req.builder.platform
-	if platform == nil {
-		// May be nil if not explicitly set in API/dockerfile
-		platform = &specs.Platform{}
-	}
-	if platform.OS == "" {
-		// Default to the dispatch requests operating system if not explicit in API/dockerfile
-		platform.OS = req.state.operatingSystem
-	}
-	if platform.OS == "" {
-		// This is a failsafe just in case. Shouldn't be hit.
-		platform.OS = runtime.GOOS
-	}
+	platform := req.builder.getPlatform(req.state)
 
 	return copier{
 		source:      req.source,
@@ -227,15 +216,15 @@ func (o *copier) calcCopyInfo(origPath string, allowWildcards bool) ([]copyInfo,
 	}
 
 	// Deal with the single file case
-	copyInfo, err := copyInfoForFile(o.source, origPath)
+	info, err := copyInfoForFile(o.source, origPath)
 	switch {
 	case imageSource == nil && errors.Is(err, os.ErrNotExist):
 		return nil, errors.Wrapf(err, "file not found in build context or excluded by .dockerignore")
 	case err != nil:
 		return nil, err
-	case copyInfo.hash != "":
-		o.storeInPathCache(imageSource, origPath, copyInfo.hash)
-		return newCopyInfos(copyInfo), err
+	case info.hash != "":
+		o.storeInPathCache(imageSource, origPath, info.hash)
+		return newCopyInfos(info), err
 	}
 
 	// TODO: remove, handle dirs in Hash()
@@ -262,7 +251,7 @@ func (o *copier) copyWithWildcards(origPath string) ([]copyInfo, error) {
 		if err != nil {
 			return err
 		}
-		rel, err := remotecontext.Rel(root, path)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
@@ -320,7 +309,7 @@ func walkSource(source builder.Source, origPath string) ([]string, error) {
 		if err != nil {
 			return err
 		}
-		rel, err := remotecontext.Rel(source.Root(), path)
+		rel, err := filepath.Rel(source.Root(), path)
 		if err != nil {
 			return err
 		}
@@ -376,15 +365,15 @@ func getFilenameForDownload(path string, resp *http.Response) string {
 	return ""
 }
 
-func downloadSource(output io.Writer, stdout io.Writer, srcURL string) (remote builder.Source, p string, err error) {
+func downloadSource(output io.Writer, stdout io.Writer, srcURL string) (remote builder.Source, p string, retErr error) {
 	u, err := url.Parse(srcURL)
 	if err != nil {
-		return
+		return nil, "", err
 	}
 
 	resp, err := remotecontext.GetWithStatusError(srcURL)
 	if err != nil {
-		return
+		return nil, "", err
 	}
 
 	filename := getFilenameForDownload(u.Path, resp)
@@ -392,11 +381,13 @@ func downloadSource(output io.Writer, stdout io.Writer, srcURL string) (remote b
 	// Prepare file in a tmp dir
 	tmpDir, err := longpath.MkdirTemp("", "docker-remote")
 	if err != nil {
-		return
+		return nil, "", err
 	}
 	defer func() {
-		if err != nil {
-			os.RemoveAll(tmpDir)
+		if retErr != nil {
+			if err := os.RemoveAll(tmpDir); err != nil {
+				log.G(context.TODO()).WithError(err).Debug("error cleaning up temp-directory after failing to download source")
+			}
 		}
 	}()
 	// If filename is empty, the returned filename will be "" but
@@ -406,21 +397,28 @@ func downloadSource(output io.Writer, stdout io.Writer, srcURL string) (remote b
 		tmpFileName = unnamedFilename
 	}
 	tmpFileName = filepath.Join(tmpDir, tmpFileName)
-	tmpFile, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	tmpFile, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return
+		return nil, "", err
 	}
+	defer func() {
+		if retErr != nil {
+			// Ignore os.ErrClosed errors, as the file may already be closed in this function.
+			if err := tmpFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				log.G(context.TODO()).WithError(err).Debug("error closing temp-file after failing to download source")
+			}
+		}
+	}()
 
 	progressOutput := streamformatter.NewJSONProgressOutput(output, true)
 	progressReader := progress.NewProgressReader(resp.Body, progressOutput, resp.ContentLength, "", "Downloading")
 	// Download and dump result to tmp file
 	// TODO: add filehash directly
 	if _, err = io.Copy(tmpFile, progressReader); err != nil {
-		tmpFile.Close()
-		return
+		return nil, "", err
 	}
 	// TODO: how important is this random blank line to the output?
-	fmt.Fprintln(stdout)
+	_, _ = fmt.Fprintln(stdout)
 
 	// Set the mtime to the Last-Modified header value if present
 	// Otherwise just remove atime and mtime
@@ -435,19 +433,28 @@ func downloadSource(output io.Writer, stdout io.Writer, srcURL string) (remote b
 		}
 	}
 
-	tmpFile.Close()
+	// TODO(thaJeztah): was there a reason for this file to be closed _before_ system.Chtimes, or could we unconditionally close this in a defer?
+	if err := tmpFile.Close(); err != nil {
+		log.G(context.TODO()).WithError(err).Debug("error closing temp-file before chtimes")
+	}
 
 	if err = system.Chtimes(tmpFileName, mTime, mTime); err != nil {
-		return
+		return nil, "", err
 	}
 
 	lc, err := remotecontext.NewLazySource(tmpDir)
 	return lc, filename, err
 }
 
+type identity struct {
+	UID int
+	GID int
+	SID string
+}
+
 type copyFileOptions struct {
 	decompress bool
-	identity   *idtools.Identity
+	identity   *identity
 	archiver   *archive.Archiver
 }
 
@@ -472,7 +479,15 @@ func performCopyForInfo(dest copyInfo, source copyInfo, options copyFileOptions)
 		return copyDirectory(archiver, srcPath, destPath, options.identity)
 	}
 	if options.decompress && archive.IsArchivePath(srcPath) && !source.noDecompress {
-		return archiver.UntarPath(srcPath, destPath)
+		f, err := os.Open(srcPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return archiver.Untar(f, destPath, &archive.TarOptions{
+			IDMap:            archiver.IDMapping,
+			BestEffortXattrs: true,
+		})
 	}
 
 	destExistsAsDir, err := isExistingDirectory(destPath)
@@ -481,7 +496,7 @@ func performCopyForInfo(dest copyInfo, source copyInfo, options copyFileOptions)
 	}
 	// dest.path must be used because destPath has already been cleaned of any
 	// trailing slash
-	if endsInSlash(dest.path) || destExistsAsDir {
+	if destExistsAsDir || strings.HasSuffix(dest.path, string(os.PathSeparator)) {
 		// source.path must be used to get the correct filename when the source
 		// is a symlink
 		destPath = filepath.Join(destPath, filepath.Base(source.path))
@@ -489,7 +504,7 @@ func performCopyForInfo(dest copyInfo, source copyInfo, options copyFileOptions)
 	return copyFile(archiver, srcPath, destPath, options.identity)
 }
 
-func copyDirectory(archiver *archive.Archiver, source, dest string, identity *idtools.Identity) error {
+func copyDirectory(archiver *archive.Archiver, source, dest string, identity *identity) error {
 	destExists, err := isExistingDirectory(dest)
 	if err != nil {
 		return errors.Wrapf(err, "failed to query destination path")
@@ -504,17 +519,13 @@ func copyDirectory(archiver *archive.Archiver, source, dest string, identity *id
 	return nil
 }
 
-func copyFile(archiver *archive.Archiver, source, dest string, identity *idtools.Identity) error {
+func copyFile(archiver *archive.Archiver, source, dest string, identity *identity) error {
 	if identity == nil {
-		// Use system.MkdirAll here, which is a custom version of os.MkdirAll
-		// modified for use on Windows to handle volume GUID paths. These paths
-		// are of the form \\?\Volume{<GUID>}\<path>. An example would be:
-		// \\?\Volume{dae8d3ac-b9a1-11e9-88eb-e8554b2ba1db}\bin\busybox.exe
-		if err := system.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return err
 		}
 	} else {
-		if err := idtools.MkdirAllAndChownNew(filepath.Dir(dest), 0755, *identity); err != nil {
+		if err := user.MkdirAllAndChown(filepath.Dir(dest), 0o755, identity.UID, identity.GID, user.WithOnlyNew); err != nil {
 			return errors.Wrapf(err, "failed to create new directory")
 		}
 	}
@@ -526,10 +537,6 @@ func copyFile(archiver *archive.Archiver, source, dest string, identity *idtools
 		return fixPermissions(source, dest, *identity, false)
 	}
 	return nil
-}
-
-func endsInSlash(path string) bool {
-	return strings.HasSuffix(path, string(filepath.Separator))
 }
 
 // isExistingDirectory returns true if the path exists and is a directory

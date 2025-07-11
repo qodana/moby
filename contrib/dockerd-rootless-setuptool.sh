@@ -37,6 +37,8 @@ BIN=""
 SYSTEMD=""
 CFG_DIR=""
 XDG_RUNTIME_DIR_CREATED=""
+USERNAME=""
+USERNAME_ESCAPED=""
 
 # run checks and also initialize global vars
 init() {
@@ -77,6 +79,11 @@ init() {
 		ERROR "HOME needs to be writable"
 		exit 1
 	fi
+
+	# Set USERNAME from `id -un` and potentially protect backslash
+	# for windbind/samba domain users
+	USERNAME=$(id -un)
+	USERNAME_ESCAPED=$(echo $USERNAME | sed 's/\\/\\\\/g')
 
 	# set CFG_DIR
 	CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -136,7 +143,16 @@ init() {
 
 	# instruction: iptables dependency check
 	faced_iptables_error=""
-	if ! command -v iptables > /dev/null 2>&1 && [ ! -f /sbin/iptables ] && [ ! -f /usr/sbin/iptables ]; then
+	# Many OSs now use iptables-nft by default so, check for module nf_tables by default. But,
+	# if "iptables --version" worked and reported "legacy", check for module ip_tables instead.
+	iptables_module="nf_tables"
+	iptables_command=$(PATH=$PATH:/sbin:/usr/sbin command -v iptables 2> /dev/null) || :
+	if [ -n "$iptables_command" ]; then
+		iptables_version=$($iptables_command --version 2> /dev/null) || :
+		case $iptables_version in
+			*legacy*) iptables_module="ip_tables" ;;
+		esac
+	else
 		faced_iptables_error=1
 		if [ -z "$OPT_SKIP_IPTABLES" ]; then
 			if command -v apt-get > /dev/null 2>&1; then
@@ -171,14 +187,14 @@ init() {
 	fi
 
 	# instruction: ip_tables module dependency check
-	if ! grep -q ip_tables /proc/modules 2> /dev/null && ! grep -q ip_tables /lib/modules/$(uname -r)/modules.builtin 2> /dev/null; then
+	if ! grep -q $iptables_module /proc/modules 2> /dev/null && ! grep -q $iptables_module /lib/modules/$(uname -r)/modules.builtin 2> /dev/null; then
 		faced_iptables_error=1
 		if [ -z "$OPT_SKIP_IPTABLES" ]; then
 			instructions=$(
 				cat <<- EOI
 					${instructions}
-					# Load ip_tables module
-					modprobe ip_tables
+					# Load $iptables_module module
+					modprobe $iptables_module
 				EOI
 			)
 		fi
@@ -221,22 +237,36 @@ init() {
 		fi
 	fi
 
-	# instructions: validate subuid/subgid files for current user
-	if ! grep -q "^$(id -un):\|^$(id -u):" /etc/subuid 2> /dev/null; then
+	# instructions: validate subuid for current user
+	error_subid=
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids "$USERNAME" > /dev/null 2>&1 || getsubids "$(id -u)" > /dev/null 2>&1 || error_subid=1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subuid 2> /dev/null || error_subid=1
+	fi
+	if [ "$error_subid" = "1" ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
-				# Add subuid entry for $(id -un)
-				echo "$(id -un):100000:65536" >> /etc/subuid
+				# Add subuid entry for ${USERNAME}
+				echo "${USERNAME}:100000:65536" >> /etc/subuid
 			EOI
 		)
 	fi
-	if ! grep -q "^$(id -un):\|^$(id -u):" /etc/subgid 2> /dev/null; then
+
+	# instructions: validate subgid for current user
+	error_subid=
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids -g "$USERNAME" > /dev/null 2>&1 || getsubids -g "$(id -u)" > /dev/null 2>&1 || error_subid=1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subgid 2> /dev/null || error_subid=1
+	fi
+	if [ "$error_subid" = "1" ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
-				# Add subgid entry for $(id -un)
-				echo "$(id -un):100000:65536" >> /etc/subgid
+				# Add subgid entry for ${USERNAME}
+				echo "${USERNAME}:100000:65536" >> /etc/subgid
 			EOI
 		)
 	fi
@@ -266,8 +296,16 @@ init() {
 
 # CLI subcommand: "check"
 cmd_entrypoint_check() {
+	init
 	# requirements are already checked in init()
 	INFO "Requirements are satisfied"
+}
+
+# CLI subcommand: "nsenter"
+cmd_entrypoint_nsenter() {
+	# No need to call init()
+	pid=$(cat "$XDG_RUNTIME_DIR/dockerd-rootless/child_pid")
+	exec nsenter --no-fork --wd="$(pwd)" --preserve-credentials -m -n -U -t "$pid" -- "$@"
 }
 
 show_systemd_error() {
@@ -292,6 +330,7 @@ install_systemd() {
 			[Unit]
 			Description=Docker Application Container Engine (Rootless)
 			Documentation=https://docs.docker.com/go/rootless/
+			Requires=dbus.socket
 
 			[Service]
 			Environment=PATH=$BIN:/sbin:/usr/sbin:$PATH
@@ -340,7 +379,7 @@ install_systemd() {
 	)
 	INFO "Installed ${SYSTEMD_UNIT} successfully."
 	INFO "To control ${SYSTEMD_UNIT}, run: \`systemctl --user (start|stop|restart) ${SYSTEMD_UNIT}\`"
-	INFO "To run ${SYSTEMD_UNIT} on system startup, run: \`sudo loginctl enable-linger $(id -un)\`"
+	INFO "To run ${SYSTEMD_UNIT} on system startup, run: \`sudo loginctl enable-linger ${USERNAME}\`"
 	echo
 }
 
@@ -376,7 +415,21 @@ cli_ctx_rm() {
 
 # CLI subcommand: "install"
 cmd_entrypoint_install() {
-	# requirements are already checked in init()
+	init
+	# Most requirements are already checked in init(), except the smoke test below for RootlessKit.
+	# https://github.com/docker/docker-install/issues/417
+
+	# check RootlessKit functionality. RootlessKit will print hints if something is still unsatisfied.
+	# (e.g., `kernel.apparmor_restrict_unprivileged_userns` constraint)
+	if ! rootlesskit true; then
+		if [ -z "$OPT_FORCE" ]; then
+			ERROR "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ . Set --force to ignore."
+			exit 1
+		else
+			WARNING "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ ."
+		fi
+	fi
+
 	if [ -z "$SYSTEMD" ]; then
 		install_nonsystemd
 	else
@@ -409,6 +462,7 @@ cmd_entrypoint_install() {
 
 # CLI subcommand: "uninstall"
 cmd_entrypoint_uninstall() {
+	init
 	# requirements are already checked in init()
 	if [ -z "$SYSTEMD" ]; then
 		INFO "systemd not detected, ${DOCKERD_ROOTLESS_SH} needs to be stopped manually:"
@@ -454,6 +508,7 @@ usage() {
 	echo
 	echo "Commands:"
 	echo "  check        Check prerequisites"
+	echo "  nsenter      Enter into RootlessKit namespaces (mostly for debugging)"
 	echo "  install      Install systemd unit (if systemd is available) and show how to manage the service"
 	echo "  uninstall    Uninstall systemd unit"
 }
@@ -501,5 +556,4 @@ if ! command -v "cmd_entrypoint_${command}" > /dev/null 2>&1; then
 fi
 
 # main
-init
-"cmd_entrypoint_${command}"
+"cmd_entrypoint_${command}" "$@"

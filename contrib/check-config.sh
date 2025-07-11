@@ -25,6 +25,10 @@ if ! command -v zgrep > /dev/null 2>&1; then
 	}
 fi
 
+useColor=true
+if [ "$NO_COLOR" = "1" ] || [ ! -t 1 ]; then
+	useColor=false
+fi
 kernelVersion="$(uname -r)"
 kernelMajor="${kernelVersion%%.*}"
 kernelMinor="${kernelVersion#$kernelMajor.}"
@@ -41,6 +45,10 @@ is_set_as_module() {
 }
 
 color() {
+	# if stdout is not a terminal, then don't do color codes.
+	if [ "$useColor" = "false" ]; then
+		return 0
+	fi
 	codes=
 	if [ "$1" = 'bold' ]; then
 		codes='1'
@@ -120,27 +128,6 @@ check_device() {
 	fi
 }
 
-check_distro_userns() {
-	if [ ! -e /etc/os-release ]; then
-		return
-	fi
-	. /etc/os-release 2> /dev/null || /bin/true
-	case "$ID" in
-		centos | rhel)
-			case "$VERSION_ID" in
-				7*)
-					# this is a CentOS7 or RHEL7 system
-					grep -q 'user_namespace.enable=1' /proc/cmdline || {
-						# no user namespace support enabled
-						wrap_bad "  (RHEL7/CentOS7" "User namespaces disabled; add 'user_namespace.enable=1' to boot command line)"
-						EXITCODE=1
-					}
-					;;
-			esac
-			;;
-	esac
-}
-
 if [ ! -e "$CONFIG" ]; then
 	wrap_warning "warning: $CONFIG does not exist, searching other paths for kernel config ..."
 	for tryConfig in $possibleConfigs; do
@@ -218,12 +205,14 @@ check_flags \
 	CGROUPS CGROUP_CPUACCT CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CPUSETS MEMCG \
 	KEYS \
 	VETH BRIDGE BRIDGE_NETFILTER \
-	IP_NF_FILTER IP_NF_TARGET_MASQUERADE \
+	IP_NF_FILTER IP_NF_MANGLE IP_NF_TARGET_MASQUERADE \
+	IP6_NF_FILTER IP6_NF_MANGLE IP6_NF_TARGET_MASQUERADE \
 	NETFILTER_XT_MATCH_ADDRTYPE \
 	NETFILTER_XT_MATCH_CONNTRACK \
 	NETFILTER_XT_MATCH_IPVS \
 	NETFILTER_XT_MARK \
-	IP_NF_NAT NF_NAT \
+	IP_NF_RAW IP_NF_NAT NF_NAT \
+	IP6_NF_RAW IP6_NF_NAT NF_NAT \
 	POSIX_MQUEUE
 # (POSIX_MQUEUE is required for bind-mounting /dev/mqueue into containers)
 
@@ -248,7 +237,6 @@ echo
 echo 'Optional Features:'
 {
 	check_flags USER_NS
-	check_distro_userns
 }
 {
 	check_flags SECCOMP
@@ -351,7 +339,7 @@ echo "  - \"$(wrap_color 'overlay' blue)\":"
 check_flags VXLAN BRIDGE_VLAN_FILTERING | sed 's/^/    /'
 echo '      Optional (for encrypted networks):'
 check_flags CRYPTO CRYPTO_AEAD CRYPTO_GCM CRYPTO_SEQIV CRYPTO_GHASH \
-	XFRM XFRM_USER XFRM_ALGO INET_ESP | sed 's/^/      /'
+	XFRM XFRM_USER XFRM_ALGO INET_ESP NETFILTER_XT_MATCH_BPF | sed 's/^/      /'
 if [ "$kernelMajor" -lt 5 ] || [ "$kernelMajor" -eq 5 -a "$kernelMinor" -le 3 ]; then
 	check_flags INET_XFRM_MODE_TRANSPORT | sed 's/^/      /'
 fi
@@ -371,11 +359,6 @@ echo '- Storage Drivers:'
 echo "  - \"$(wrap_color 'btrfs' blue)\":"
 check_flags BTRFS_FS | sed 's/^/    /'
 check_flags BTRFS_FS_POSIX_ACL | sed 's/^/    /'
-[ "$EXITCODE" = 0 ] && STORAGE=0
-EXITCODE=0
-
-echo "  - \"$(wrap_color 'devicemapper' blue)\":"
-check_flags BLK_DEV_DM DM_THIN_PROVISIONING | sed 's/^/    /'
 [ "$EXITCODE" = 0 ] && STORAGE=0
 EXITCODE=0
 

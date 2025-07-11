@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -9,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestVolumeRemoveError(t *testing.T) {
@@ -18,9 +20,27 @@ func TestVolumeRemoveError(t *testing.T) {
 	}
 
 	err := client.VolumeRemove(context.Background(), "volume_id", false)
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	err = client.VolumeRemove(context.Background(), "", false)
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	err = client.VolumeRemove(context.Background(), "    ", false)
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+}
+
+// TestVolumeRemoveConnectionError verifies that connection errors occurring
+// during API-version negotiation are not shadowed by API-version errors.
+//
+// Regression test for https://github.com/docker/cli/issues/4890
+func TestVolumeRemoveConnectionError(t *testing.T) {
+	client, err := NewClientWithOpts(WithAPIVersionNegotiation(), WithHost("tcp://no-such-host.invalid"))
+	assert.NilError(t, err)
+
+	err = client.VolumeRemove(context.Background(), "volume_id", false)
+	assert.Check(t, is.ErrorType(err, IsErrConnectionFailed))
 }
 
 func TestVolumeRemove(t *testing.T) {
@@ -42,7 +62,5 @@ func TestVolumeRemove(t *testing.T) {
 	}
 
 	err := client.VolumeRemove(context.Background(), "volume_id", false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 }

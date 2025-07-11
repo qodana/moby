@@ -4,16 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/docker/docker/api/types"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/builder-next/exporter"
@@ -21,11 +23,10 @@ import (
 	"github.com/docker/docker/builder/builder-next/exporter/overrides"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork"
 	"github.com/docker/docker/opts"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/streamformatter"
-	"github.com/docker/go-units"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/control"
@@ -33,10 +34,13 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/tracing"
+	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	grpcmetadata "google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 type errMultipleFilterValues struct{}
@@ -78,6 +82,7 @@ var cacheFields = map[string]bool{
 type Opt struct {
 	SessionManager      *session.Manager
 	Root                string
+	EngineID            string
 	Dist                images.DistributionServices
 	ImageTagger         mobyexporter.ImageTagger
 	NetworkController   *libnetwork.Controller
@@ -85,13 +90,15 @@ type Opt struct {
 	RegistryHosts       docker.RegistryHosts
 	BuilderConfig       config.BuilderConfig
 	Rootless            bool
-	IdentityMapping     idtools.IdentityMapping
+	IdentityMapping     user.IdentityMapping
 	DNSConfig           config.DNSConfig
 	ApparmorProfile     string
 	UseSnapshotter      bool
 	Snapshotter         string
 	ContainerdAddress   string
 	ContainerdNamespace string
+	Callbacks           exporter.BuildkitCallbacks
+	CDICache            *cdi.Cache
 }
 
 // Builder can build using BuildKit backend
@@ -123,6 +130,10 @@ func New(ctx context.Context, opt Opt) (*Builder, error) {
 	return b, nil
 }
 
+func (b *Builder) Close() error {
+	return b.controller.Close()
+}
+
 // RegisterGRPC registers controller to the grpc server.
 func (b *Builder) RegisterGRPC(s *grpc.Server) {
 	b.controller.Register(s)
@@ -139,15 +150,15 @@ func (b *Builder) Cancel(ctx context.Context, id string) error {
 }
 
 // DiskUsage returns a report about space used by build cache
-func (b *Builder) DiskUsage(ctx context.Context) ([]*types.BuildCache, error) {
+func (b *Builder) DiskUsage(ctx context.Context) ([]*build.CacheRecord, error) {
 	duResp, err := b.controller.DiskUsage(ctx, &controlapi.DiskUsageRequest{})
 	if err != nil {
 		return nil, err
 	}
 
-	var items []*types.BuildCache
+	var items []*build.CacheRecord
 	for _, r := range duResp.Record {
-		items = append(items, &types.BuildCache{
+		items = append(items, &build.CacheRecord{
 			ID:          r.ID,
 			Parent:      r.Parent, //nolint:staticcheck // ignore SA1019 (Parent field is deprecated)
 			Parents:     r.Parents,
@@ -155,17 +166,28 @@ func (b *Builder) DiskUsage(ctx context.Context) ([]*types.BuildCache, error) {
 			Description: r.Description,
 			InUse:       r.InUse,
 			Shared:      r.Shared,
-			Size:        r.Size_,
-			CreatedAt:   r.CreatedAt,
-			LastUsedAt:  r.LastUsedAt,
-			UsageCount:  int(r.UsageCount),
+			Size:        r.Size,
+			CreatedAt: func() time.Time {
+				if r.CreatedAt != nil {
+					return r.CreatedAt.AsTime()
+				}
+				return time.Time{}
+			}(),
+			LastUsedAt: func() *time.Time {
+				if r.LastUsedAt == nil {
+					return nil
+				}
+				t := r.LastUsedAt.AsTime()
+				return &t
+			}(),
+			UsageCount: int(r.UsageCount),
 		})
 	}
 	return items, nil
 }
 
-// Prune clears all reclaimable build cache
-func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) (int64, []string, error) {
+// Prune clears all reclaimable build cache.
+func (b *Builder) Prune(ctx context.Context, opts build.CachePruneOptions) (int64, []string, error) {
 	ch := make(chan *controlapi.UsageRecord)
 
 	eg, ctx := errgroup.WithContext(ctx)
@@ -190,10 +212,12 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 	eg.Go(func() error {
 		defer close(ch)
 		return b.controller.Prune(&controlapi.PruneRequest{
-			All:          pi.All,
-			KeepDuration: int64(pi.KeepDuration),
-			KeepBytes:    pi.KeepBytes,
-			Filter:       pi.Filter,
+			All:           pi.All,
+			KeepDuration:  int64(pi.KeepDuration),
+			ReservedSpace: pi.ReservedSpace,
+			MaxUsedSpace:  pi.MaxUsedSpace,
+			MinFreeSpace:  pi.MinFreeSpace,
+			Filter:        pi.Filter,
 		}, &pruneProxy{
 			streamProxy: streamProxy{ctx: ctx},
 			ch:          ch,
@@ -204,7 +228,7 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 	var cacheIDs []string
 	eg.Go(func() error {
 		for r := range ch {
-			size += r.Size_
+			size += r.Size
 			cacheIDs = append(cacheIDs, r.ID)
 		}
 		return nil
@@ -223,7 +247,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		return nil, errors.Errorf("multiple outputs not supported")
 	}
 
-	var rc = opt.Source
+	rc := opt.Source
 	if buildID := opt.Options.BuildID; buildID != "" {
 		b.mu.Lock()
 
@@ -268,8 +292,6 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 	}
 
 	var out builder.Result
-
-	id := identity.NewID()
 
 	frontendAttrs := map[string]string{}
 
@@ -321,20 +343,20 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		// TODO: remove once opt.Options.Platform is of type specs.Platform
 		_, err := platforms.Parse(opt.Options.Platform)
 		if err != nil {
-			return nil, err
+			return nil, errdefs.InvalidParameter(err)
 		}
 		frontendAttrs["platform"] = opt.Options.Platform
 	}
 
 	switch opt.Options.NetworkMode {
-	case "host", "none":
+	case network.NetworkHost, network.NetworkNone:
 		frontendAttrs["force-network-mode"] = opt.Options.NetworkMode
-	case "", "default":
+	case "", network.NetworkDefault:
 	default:
 		return nil, errors.Errorf("network mode %q not supported by buildkit", opt.Options.NetworkMode)
 	}
 
-	extraHosts, err := toBuildkitExtraHosts(opt.Options.ExtraHosts, b.dnsconfig.HostGatewayIP)
+	extraHosts, err := toBuildkitExtraHosts(opt.Options.ExtraHosts, b.dnsconfig.HostGatewayIPs)
 	if err != nil {
 		return nil, err
 	}
@@ -347,18 +369,14 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 	ulimits, err := toBuildkitUlimits(opt.Options.Ulimits)
 	if err != nil {
 		return nil, err
-	} else if len(ulimits) > 0 {
+	} else if ulimits != "" {
 		frontendAttrs["ulimit"] = ulimits
 	}
 
 	exporterName := ""
 	exporterAttrs := map[string]string{}
 	if len(opt.Options.Outputs) == 0 {
-		if b.useSnapshotter {
-			exporterName = client.ExporterImage
-		} else {
-			exporterName = exporter.Moby
-		}
+		exporterName = exporter.Moby
 	} else {
 		// cacheonly is a special type for triggering skipping all exporters
 		if opt.Options.Outputs[0].Type != "cacheonly" {
@@ -378,7 +396,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		exporterAttrs["name"] = strings.Join(nameAttr, ",")
 	}
 
-	cache := controlapi.CacheOptions{}
+	cache := &controlapi.CacheOptions{}
 	if inlineCache := opt.Options.BuildArgs["BUILDKIT_INLINE_CACHE"]; inlineCache != nil {
 		if b, err := strconv.ParseBool(*inlineCache); err == nil && b {
 			cache.Exports = append(cache.Exports, &controlapi.CacheOptionsEntry{
@@ -387,18 +405,20 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		}
 	}
 
+	id := identity.NewID()
 	req := &controlapi.SolveRequest{
-		Ref:           id,
-		Exporter:      exporterName,
-		ExporterAttrs: exporterAttrs,
+		Ref: id,
+		Exporters: []*controlapi.Exporter{
+			{Type: exporterName, Attrs: exporterAttrs},
+		},
 		Frontend:      "dockerfile.v0",
 		FrontendAttrs: frontendAttrs,
 		Session:       opt.Options.SessionID,
 		Cache:         cache,
 	}
 
-	if opt.Options.NetworkMode == "host" {
-		req.Entitlements = append(req.Entitlements, entitlements.EntitlementNetworkHost)
+	if opt.Options.NetworkMode == network.NetworkHost {
+		req.Entitlements = append(req.Entitlements, string(entitlements.EntitlementNetworkHost))
 	}
 
 	aux := streamformatter.AuxFormatter{Writer: opt.ProgressWriter.Output}
@@ -413,12 +433,12 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		if exporterName != exporter.Moby && exporterName != client.ExporterImage {
 			return nil
 		}
-		id, ok := resp.ExporterResponse["containerimage.digest"]
+		imgID, ok := resp.ExporterResponse["containerimage.digest"]
 		if !ok {
 			return errors.Errorf("missing image id")
 		}
-		out.ImageID = id
-		return aux.Emit("moby.image.id", types.BuildResult{ID: id})
+		out.ImageID = imgID
+		return aux.Emit("moby.image.id", build.Result{ID: imgID})
 	})
 
 	ch := make(chan *controlapi.StatusResponse)
@@ -433,7 +453,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 
 	eg.Go(func() error {
 		for sr := range ch {
-			dt, err := sr.Marshal()
+			dt, err := proto.Marshal(sr)
 			if err != nil {
 				return err
 			}
@@ -469,6 +489,7 @@ func (sp *streamProxy) SetTrailer(_ grpcmetadata.MD) {
 func (sp *streamProxy) Context() context.Context {
 	return sp.ctx
 }
+
 func (sp *streamProxy) RecvMsg(m interface{}) error {
 	return io.EOF
 }
@@ -481,6 +502,7 @@ type statusProxy struct {
 func (sp *statusProxy) Send(resp *controlapi.StatusResponse) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *statusProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.StatusResponse); ok {
 		sp.ch <- sr
@@ -496,6 +518,7 @@ type pruneProxy struct {
 func (sp *pruneProxy) Send(resp *controlapi.UsageRecord) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *pruneProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.UsageRecord); ok {
 		sp.ch <- sr
@@ -513,11 +536,12 @@ type wrapRC struct {
 func (w *wrapRC) Read(b []byte) (int, error) {
 	n, err := w.ReadCloser.Read(b)
 	if err != nil {
-		e := err
-		if e == io.EOF {
-			e = nil
+		switch err {
+		case io.EOF:
+			w.close(nil)
+		default:
+			w.close(err)
 		}
-		w.close(e)
 	}
 	return n, err
 }
@@ -579,7 +603,7 @@ func (j *buildJob) SetUpload(ctx context.Context, rc io.ReadCloser) error {
 }
 
 // toBuildkitExtraHosts converts hosts from docker key:value format to buildkit's csv format
-func toBuildkitExtraHosts(inp []string, hostGatewayIP net.IP) (string, error) {
+func toBuildkitExtraHosts(inp []string, hostGatewayIPs []netip.Addr) (string, error) {
 	if len(inp) == 0 {
 		return "", nil
 	}
@@ -590,23 +614,23 @@ func toBuildkitExtraHosts(inp []string, hostGatewayIP net.IP) (string, error) {
 			return "", errors.Errorf("invalid host %s", h)
 		}
 		// If the IP Address is a "host-gateway", replace this value with the
-		// IP address stored in the daemon level HostGatewayIP config variable.
+		// IP address(es) stored in the daemon level HostGatewayIPs config variable.
 		if ip == opts.HostGatewayName {
-			gateway := hostGatewayIP.String()
-			if gateway == "" {
-				return "", fmt.Errorf("unable to derive the IP value for host-gateway")
+			if len(hostGatewayIPs) == 0 {
+				return "", errors.New("unable to derive the IP value for host-gateway")
 			}
-			ip = gateway
-		} else if net.ParseIP(ip) == nil {
-			return "", fmt.Errorf("invalid host %s", h)
+			for _, gip := range hostGatewayIPs {
+				hosts = append(hosts, host+"="+gip.String())
+			}
+		} else {
+			hosts = append(hosts, host+"="+ip)
 		}
-		hosts = append(hosts, host+"="+ip)
 	}
 	return strings.Join(hosts, ","), nil
 }
 
 // toBuildkitUlimits converts ulimits from docker type=soft:hard format to buildkit's csv format
-func toBuildkitUlimits(inp []*units.Ulimit) (string, error) {
+func toBuildkitUlimits(inp []*container.Ulimit) (string, error) {
 	if len(inp) == 0 {
 		return "", nil
 	}
@@ -617,7 +641,7 @@ func toBuildkitUlimits(inp []*units.Ulimit) (string, error) {
 	return strings.Join(ulimits, ","), nil
 }
 
-func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, error) {
+func toBuildkitPruneInfo(opts build.CachePruneOptions) (client.PruneInfo, error) {
 	var until time.Duration
 	untilValues := opts.Filters.Get("until")          // canonical
 	unusedForValues := opts.Filters.Get("unused-for") // deprecated synonym for "until" filter
@@ -671,10 +695,17 @@ func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, e
 			}
 		}
 	}
+
+	if opts.ReservedSpace == 0 && opts.KeepStorage != 0 {
+		opts.ReservedSpace = opts.KeepStorage
+	}
+
 	return client.PruneInfo{
-		All:          opts.All,
-		KeepDuration: until,
-		KeepBytes:    opts.KeepStorage,
-		Filter:       []string{strings.Join(bkFilter, ",")},
+		All:           opts.All,
+		KeepDuration:  until,
+		ReservedSpace: opts.ReservedSpace,
+		MaxUsedSpace:  opts.MaxUsedSpace,
+		MinFreeSpace:  opts.MinFreeSpace,
+		Filter:        []string{strings.Join(bkFilter, ",")},
 	}, nil
 }

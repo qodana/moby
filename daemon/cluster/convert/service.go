@@ -1,4 +1,4 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
 	"fmt"
@@ -69,6 +69,8 @@ func ServiceFromGRPC(s swarmapi.Service) (types.Service, error) {
 			service.UpdateStatus.State = types.UpdateStateRollbackPaused
 		case swarmapi.UpdateStatus_ROLLBACK_COMPLETED:
 			service.UpdateStatus.State = types.UpdateStateRollbackCompleted
+		default:
+			// TODO(thaJeztah): make switch exhaustive; add api.UpdateStatus_UNKNOWN
 		}
 
 		startedAt, _ := gogotypes.TimestampFromProto(s.UpdateStatus.StartedAt)
@@ -158,8 +160,8 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 		name = namesgenerator.GetRandomName(0)
 	}
 
-	serviceNetworks := make([]*swarmapi.NetworkAttachmentConfig, 0, len(s.Networks))
-	for _, n := range s.Networks {
+	serviceNetworks := make([]*swarmapi.NetworkAttachmentConfig, 0, len(s.Networks)) //nolint:staticcheck // ignore SA1019: field is deprecated.
+	for _, n := range s.Networks {                                                   //nolint:staticcheck // ignore SA1019: field is deprecated.
 		netConfig := &swarmapi.NetworkAttachmentConfig{Target: n.Target, Aliases: n.Aliases, DriverAttachmentOpts: n.DriverOpts}
 		serviceNetworks = append(serviceNetworks, netConfig)
 	}
@@ -316,7 +318,7 @@ func ServiceSpecToGRPC(s types.ServiceSpec) (swarmapi.ServiceSpec, error) {
 	}
 
 	if numModes > 1 {
-		return swarmapi.ServiceSpec{}, fmt.Errorf("must specify only one service mode")
+		return swarmapi.ServiceSpec{}, errors.New("must specify only one service mode")
 	}
 
 	if s.Mode.Global != nil {

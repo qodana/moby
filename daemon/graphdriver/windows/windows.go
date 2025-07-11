@@ -1,12 +1,12 @@
 //go:build windows
-// +build windows
 
-package windows // import "github.com/docker/docker/daemon/graphdriver/windows"
+package windows
 
 import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,22 +18,22 @@ import (
 	"sync"
 	"time"
 
-	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/backuptar"
 	winiofs "github.com/Microsoft/go-winio/pkg/fs"
 	"github.com/Microsoft/go-winio/vhd"
 	"github.com/Microsoft/hcsshim"
 	"github.com/Microsoft/hcsshim/osversion"
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/daemon/internal/mountref"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/longpath"
-	"github.com/docker/docker/pkg/reexec"
-	"github.com/docker/docker/pkg/system"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/moby/go-archive"
+	"github.com/moby/sys/reexec"
+	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
 
@@ -65,18 +65,11 @@ func init() {
 	// DOCKER_WINDOWSFILTER_NOREEXEC allows for inline processing which makes
 	// debugging issues in the re-exec codepath significantly easier.
 	if os.Getenv("DOCKER_WINDOWSFILTER_NOREEXEC") != "" {
-		logrus.Warnf("WindowsGraphDriver is set to not re-exec. This is intended for debugging purposes only.")
+		log.G(context.TODO()).Warnf("WindowsGraphDriver is set to not re-exec. This is intended for debugging purposes only.")
 		noreexec = true
 	} else {
 		reexec.Register("docker-windows-write-layer", writeLayerReexec)
 	}
-}
-
-type checker struct {
-}
-
-func (c *checker) IsMounted(path string) bool {
-	return false
 }
 
 type storageOptions struct {
@@ -87,7 +80,7 @@ type storageOptions struct {
 type Driver struct {
 	// info stores the shim driver information
 	info hcsshim.DriverInfo
-	ctr  *graphdriver.RefCounter
+	ctr  *mountref.Counter
 	// it is safe for windows to use a cache here because it does not support
 	// restoring containers when the daemon dies.
 	cacheMu            sync.Mutex
@@ -96,8 +89,8 @@ type Driver struct {
 }
 
 // InitFilter returns a new Windows storage filter driver.
-func InitFilter(home string, options []string, _ idtools.IdentityMapping) (graphdriver.Driver, error) {
-	logrus.Debugf("WindowsGraphDriver InitFilter at %s", home)
+func InitFilter(home string, options []string, _ user.IdentityMapping) (graphdriver.Driver, error) {
+	log.G(context.TODO()).Debugf("WindowsGraphDriver InitFilter at %s", home)
 
 	fsType, err := winiofs.GetFileSystemType(home)
 	if err != nil {
@@ -109,7 +102,7 @@ func InitFilter(home string, options []string, _ idtools.IdentityMapping) (graph
 
 	// Setting file-mode is a no-op on Windows, so passing "0" to make it more
 	// transparent that the filemode passed has no effect.
-	if err = system.MkdirAll(home, 0); err != nil {
+	if err = os.MkdirAll(home, 0); err != nil {
 		return nil, errors.Wrapf(err, "windowsfilter failed to create '%s'", home)
 	}
 
@@ -133,10 +126,16 @@ func InitFilter(home string, options []string, _ idtools.IdentityMapping) (graph
 			Flavour: filterDriver,
 		},
 		cache:              make(map[string]string),
-		ctr:                graphdriver.NewRefCounter(&checker{}),
+		ctr:                mountref.NewCounter(isMounted),
 		defaultStorageOpts: opts,
 	}
 	return d, nil
+}
+
+// isMounted checks whether the given path is mounted. It always returns
+// false for the WindowsFilter graphdriver.
+func isMounted(string) bool {
+	return false
 }
 
 // String returns the string representation of a driver. This should match
@@ -242,14 +241,14 @@ func (d *Driver) create(id, parent, mountLabel string, readOnly bool, storageOpt
 
 	if _, err := os.Lstat(d.dir(parent)); err != nil {
 		if err2 := hcsshim.DestroyLayer(d.info, id); err2 != nil {
-			logrus.Warnf("Failed to DestroyLayer %s: %s", id, err2)
+			log.G(context.TODO()).Warnf("Failed to DestroyLayer %s: %s", id, err2)
 		}
 		return errors.Wrapf(err, "cannot create layer with missing parent %s", parent)
 	}
 
 	if err := d.setLayerChain(id, layerChain); err != nil {
 		if err2 := hcsshim.DestroyLayer(d.info, id); err2 != nil {
-			logrus.Warnf("Failed to DestroyLayer %s: %s", id, err2)
+			log.G(context.TODO()).Warnf("Failed to DestroyLayer %s: %s", id, err2)
 		}
 		return err
 	}
@@ -352,7 +351,7 @@ func (d *Driver) Remove(id string) error {
 		}
 	}
 	if err := hcsshim.DestroyLayer(d.info, tmpID); err != nil {
-		logrus.Errorf("Failed to DestroyLayer %s: %s", id, err)
+		log.G(context.TODO()).Errorf("Failed to DestroyLayer %s: %s", id, err)
 	}
 
 	return nil
@@ -365,7 +364,7 @@ func (d *Driver) GetLayerPath(id string) (string, error) {
 
 // Get returns the rootfs path for the id. This will mount the dir at its given path.
 func (d *Driver) Get(id, mountLabel string) (string, error) {
-	logrus.Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, mountLabel)
+	log.G(context.TODO()).Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, mountLabel)
 	var dir string
 
 	rID, err := d.resolveID(id)
@@ -390,7 +389,7 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 	if err := hcsshim.PrepareLayer(d.info, rID, layerChain); err != nil {
 		d.ctr.Decrement(rID)
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
-			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
+			log.G(context.TODO()).Warnf("Failed to Deactivate %s: %s", id, err)
 		}
 		return "", err
 	}
@@ -399,10 +398,10 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 	if err != nil {
 		d.ctr.Decrement(rID)
 		if err := hcsshim.UnprepareLayer(d.info, rID); err != nil {
-			logrus.Warnf("Failed to Unprepare %s: %s", id, err)
+			log.G(context.TODO()).Warnf("Failed to Unprepare %s: %s", id, err)
 		}
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
-			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
+			log.G(context.TODO()).Warnf("Failed to Deactivate %s: %s", id, err)
 		}
 		return "", err
 	}
@@ -423,7 +422,7 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 
 // Put adds a new layer to the driver.
 func (d *Driver) Put(id string) error {
-	logrus.Debugf("WindowsGraphDriver Put() id %s", id)
+	log.G(context.TODO()).Debugf("WindowsGraphDriver Put() id %s", id)
 
 	rID, err := d.resolveID(id)
 	if err != nil {
@@ -467,9 +466,9 @@ func (d *Driver) Cleanup() error {
 	for _, item := range items {
 		if item.IsDir() && strings.HasSuffix(item.Name(), "-removing") {
 			if err := hcsshim.DestroyLayer(d.info, item.Name()); err != nil {
-				logrus.Warnf("Failed to cleanup %s: %s", item.Name(), err)
+				log.G(context.TODO()).Warnf("Failed to cleanup %s: %s", item.Name(), err)
 			} else {
-				logrus.Infof("Cleaned up %s", item.Name())
+				log.G(context.TODO()).Infof("Cleaned up %s", item.Name())
 			}
 		}
 	}
@@ -480,15 +479,15 @@ func (d *Driver) Cleanup() error {
 // Diff produces an archive of the changes between the specified
 // layer and its parent layer which may be "".
 // The layer should be mounted when calling this function
-func (d *Driver) Diff(id, _ string) (_ io.ReadCloser, err error) {
+func (d *Driver) Diff(id, _ string) (io.ReadCloser, error) {
 	rID, err := d.resolveID(id)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	layerChain, err := d.getLayerChain(rID)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	// this is assuming that the layer is unmounted
@@ -497,14 +496,14 @@ func (d *Driver) Diff(id, _ string) (_ io.ReadCloser, err error) {
 	}
 	prepare := func() {
 		if err := hcsshim.PrepareLayer(d.info, rID, layerChain); err != nil {
-			logrus.Warnf("Failed to Deactivate %s: %s", rID, err)
+			log.G(context.TODO()).Warnf("Failed to Deactivate %s: %s", rID, err)
 		}
 	}
 
 	arch, err := d.exportLayer(rID, layerChain)
 	if err != nil {
 		prepare()
-		return
+		return nil, err
 	}
 	return ioutils.NewReadCloserWrapper(arch, func() error {
 		err := arch.Close()
@@ -531,7 +530,7 @@ func (d *Driver) Changes(id, _ string) ([]archive.Change, error) {
 	}
 	defer func() {
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
-			logrus.Errorf("changes() failed to DeactivateLayer %s %s: %s", id, rID, err2)
+			log.G(context.TODO()).Errorf("changes() failed to DeactivateLayer %s %s: %s", id, rID, err2)
 		}
 	}()
 
@@ -605,20 +604,20 @@ func (d *Driver) ApplyDiff(id, parent string, diff io.Reader) (int64, error) {
 // DiffSize calculates the changes between the specified layer
 // and its parent and returns the size in bytes of the changes
 // relative to its base filesystem directory.
-func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
+func (d *Driver) DiffSize(id, parent string) (int64, error) {
 	rPId, err := d.resolveID(parent)
 	if err != nil {
-		return
+		return 0, err
 	}
 
 	changes, err := d.Changes(id, rPId)
 	if err != nil {
-		return
+		return 0, err
 	}
 
 	layerFs, err := d.Get(id, "")
 	if err != nil {
-		return
+		return 0, err
 	}
 	defer d.Put(id)
 
@@ -684,26 +683,26 @@ func (d *Driver) exportLayer(id string, parentLayerPaths []string) (io.ReadClose
 // writeBackupStreamFromTarAndSaveMutatedFiles reads data from a tar stream and
 // writes it to a backup stream, and also saves any files that will be mutated
 // by the import layer process to a backup location.
-func writeBackupStreamFromTarAndSaveMutatedFiles(buf *bufio.Writer, w io.Writer, t *tar.Reader, hdr *tar.Header, root string) (nextHdr *tar.Header, err error) {
-	var bcdBackup *os.File
-	var bcdBackupWriter *winio.BackupFileWriter
+func writeBackupStreamFromTarAndSaveMutatedFiles(buf *bufio.Writer, w io.Writer, t *tar.Reader, hdr *tar.Header, root string) (nextHdr *tar.Header, retErr error) {
 	if backupPath, ok := mutatedFiles[hdr.Name]; ok {
-		bcdBackup, err = os.Create(filepath.Join(root, backupPath))
+		bcdBackup, err := os.Create(filepath.Join(root, backupPath))
 		if err != nil {
 			return nil, err
 		}
 		defer func() {
-			cerr := bcdBackup.Close()
-			if err == nil {
-				err = cerr
+			if err := bcdBackup.Close(); err != nil {
+				if retErr == nil {
+					retErr = err
+				}
 			}
 		}()
 
-		bcdBackupWriter = winio.NewBackupFileWriter(bcdBackup, false)
+		bcdBackupWriter := winio.NewBackupFileWriter(bcdBackup, false)
 		defer func() {
-			cerr := bcdBackupWriter.Close()
-			if err == nil {
-				err = cerr
+			if err := bcdBackupWriter.Close(); err != nil {
+				if retErr == nil {
+					retErr = err
+				}
 			}
 		}()
 
@@ -713,9 +712,10 @@ func writeBackupStreamFromTarAndSaveMutatedFiles(buf *bufio.Writer, w io.Writer,
 	}
 
 	defer func() {
-		ferr := buf.Flush()
-		if err == nil {
-			err = ferr
+		if err := buf.Flush(); err != nil {
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}()
 
@@ -767,7 +767,7 @@ func writeLayerFromTar(r io.Reader, w hcsshim.LayerWriter, root string) (int64, 
 }
 
 // importLayer adds a new layer to the tag and graph store based on the given data.
-func (d *Driver) importLayer(id string, layerData io.Reader, parentLayerPaths []string) (size int64, err error) {
+func (d *Driver) importLayer(id string, layerData io.Reader, parentLayerPaths []string) (size int64, _ error) {
 	if !noreexec {
 		cmd := reexec.Command(append([]string{"docker-windows-write-layer", d.info.HomeDir, id}, parentLayerPaths...)...)
 		output := bytes.NewBuffer(nil)
@@ -775,11 +775,11 @@ func (d *Driver) importLayer(id string, layerData io.Reader, parentLayerPaths []
 		cmd.Stdout = output
 		cmd.Stderr = output
 
-		if err = cmd.Start(); err != nil {
-			return
+		if err := cmd.Start(); err != nil {
+			return 0, err
 		}
 
-		if err = cmd.Wait(); err != nil {
+		if err := cmd.Wait(); err != nil {
 			return 0, fmt.Errorf("re-exec error: %v: output: %s", err, output)
 		}
 
@@ -845,7 +845,7 @@ func (d *Driver) resolveID(id string) (string, error) {
 
 // setID stores the layerId in disk.
 func (d *Driver) setID(id, altID string) error {
-	return os.WriteFile(filepath.Join(d.dir(id), "layerId"), []byte(altID), 0600)
+	return os.WriteFile(filepath.Join(d.dir(id), "layerId"), []byte(altID), 0o600)
 }
 
 // getLayerChain returns the layer chain information.

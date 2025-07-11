@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 // Shim for the Host Network Service (HNS) to manage networking for
 // Windows Server containers and Hyper-V containers. This module
@@ -13,21 +12,26 @@
 package windows
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/Microsoft/hcsshim"
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
-	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/portmapper"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
-	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // networkConfiguration for network specific configuration
@@ -101,7 +105,7 @@ type hnsNetwork struct {
 type driver struct {
 	name     string
 	networks map[string]*hnsNetwork
-	store    datastore.DataStore
+	store    *datastore.Store
 	sync.Mutex
 }
 
@@ -109,42 +113,98 @@ const (
 	errNotFound = "HNS failed with error : The object identifier does not represent a valid object. "
 )
 
+var builtinLocalDrivers = map[string]struct{}{
+	"transparent": {},
+	"l2bridge":    {},
+	"l2tunnel":    {},
+	"nat":         {},
+	"internal":    {},
+	"private":     {},
+	"ics":         {},
+}
+
 // IsBuiltinLocalDriver validates if network-type is a builtin local-scoped driver
 func IsBuiltinLocalDriver(networkType string) bool {
-	if "l2bridge" == networkType || "l2tunnel" == networkType ||
-		"nat" == networkType || "ics" == networkType ||
-		"transparent" == networkType || "internal" == networkType ||
-		"private" == networkType {
-		return true
+	_, ok := builtinLocalDrivers[networkType]
+	return ok
+}
+
+var unadoptableNetworkTypes = map[string]struct{}{
+	// "internal" and "private" are included here to preserve the workarounds added
+	// in commits b91fd26 ("Ignore HNS networks with type Private") and 6a1a4f9 ("Fix
+	// long startup on windows, with non-hns governed Hyper-V networks").
+	//
+	// That long delay was caused by trying to load network driver plugins named
+	// "internal" and "private". The workaround doesn't seem necessary now, because
+	// those network types are both associated with the windows [driver] by the
+	// entries in [builtinLocalDrivers]. (The code has been refactored, but those
+	// network types were included at the time the workaround was added. Something
+	// else must have changed in the meantime.)
+	//
+	// TODO(robmry) - remove internal/private from this map? ...
+	//
+	// On startup the daemon tries to adopt all existing HNS networks by creating
+	// corresponding Docker networks. (HNS is the source of truth for Windows, not
+	// Docker's network store.)
+	//
+	// So, removing internal/private from this map would have two consequences
+	// (removing restrictions that were probably introduced unintentionally by the
+	// workarounds mentioned above):
+	// - internal/private networks created on the host would appear in Docker's list
+	//   of networks, and it'd be possible to create containers in those networks.
+	//   That would match the behaviour for other network types (including the other
+	//   currently-undocumented type "ics").
+	// - On startup, if an internal/private network originally created by Docker has
+	//   been reconfigured outside Docker, the network definition in Docker's store
+	//   will be updated to match the current HNS configuration (as it is for other
+	//   network types).
+	"internal": {},
+	"private":  {},
+
+	// "mirrored" is not currently in the list of HNS network types understood by
+	// Docker [builtinLocalDrivers]. So, it's not possible for Docker to create a
+	// network of this type. And, if the host has "mirrored" networks, Docker
+	// should not spend time on startup trying to load a plugin called "mirrored".
+	"mirrored": {},
+}
+
+// IsAdoptableNetworkType returns true if HNS networks of this type can be
+// adopted on startup when searching for networks created outside Docker
+// (these networks can be added to the network store).
+func IsAdoptableNetworkType(networkType string) bool {
+	_, ok := unadoptableNetworkTypes[strings.ToLower(networkType)]
+	return !ok
+}
+
+func newDriver(networkType string, store *datastore.Store) (*driver, error) {
+	d := &driver{
+		name:     networkType,
+		store:    store,
+		networks: map[string]*hnsNetwork{},
 	}
-
-	return false
+	err := d.initStore()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize %q driver: %w", networkType, err)
+	}
+	return d, nil
 }
 
-// New constructs a new bridge driver
-func newDriver(networkType string) *driver {
-	return &driver{name: networkType, networks: map[string]*hnsNetwork{}}
-}
-
-// GetInit returns an initializer for the given network type
-func GetInit(networkType string) func(dc driverapi.Registerer, config map[string]interface{}) error {
-	return func(dc driverapi.Registerer, config map[string]interface{}) error {
-		if !IsBuiltinLocalDriver(networkType) {
-			return types.BadRequestErrorf("Network type not supported: %s", networkType)
-		}
-
-		d := newDriver(networkType)
-
-		err := d.initStore(config)
+// RegisterBuiltinLocalDrivers registers the builtin local drivers.
+func RegisterBuiltinLocalDrivers(r driverapi.Registerer, store *datastore.Store) error {
+	for networkType := range builtinLocalDrivers {
+		d, err := newDriver(networkType, store)
 		if err != nil {
 			return err
 		}
-
-		return dc.RegisterDriver(networkType, d, driverapi.Capability{
-			DataScope:         datastore.LocalScope,
-			ConnectivityScope: datastore.LocalScope,
+		err = r.RegisterDriver(networkType, d, driverapi.Capability{
+			DataScope:         scope.Local,
+			ConnectivityScope: scope.Local,
 		})
+		if err != nil {
+			return fmt.Errorf("failed to register %q driver: %w", networkType, err)
+		}
 	}
+	return nil
 }
 
 func (d *driver) getNetwork(id string) (*hnsNetwork, error) {
@@ -196,7 +256,7 @@ func (d *driver) parseNetworkOptions(id string, genericOptions map[string]string
 			config.MacPools = make([]hcsshim.MacPool, 0)
 			s := strings.Split(value, ",")
 			if len(s)%2 != 0 {
-				return nil, types.BadRequestErrorf("Invalid mac pool. You must specify both a start range and an end range")
+				return nil, types.InvalidParameterErrorf("invalid mac pool. You must specify both a start range and an end range")
 			}
 			for i := 0; i < len(s)-1; i += 2 {
 				config.MacPools = append(config.MacPools, hcsshim.MacPool{
@@ -233,13 +293,13 @@ func (d *driver) parseNetworkOptions(id string, genericOptions map[string]string
 	return config, nil
 }
 
-func (c *networkConfiguration) processIPAM(id string, ipamV4Data, ipamV6Data []driverapi.IPAMData) error {
+func (ncfg *networkConfiguration) processIPAM(id string, ipamV4Data, ipamV6Data []driverapi.IPAMData) error {
 	if len(ipamV6Data) > 0 {
 		return types.ForbiddenErrorf("windowsshim driver doesn't support v6 subnets")
 	}
 
 	if len(ipamV4Data) == 0 {
-		return types.BadRequestErrorf("network %s requires ipv4 configuration", id)
+		return types.InvalidParameterErrorf("network %s requires ipv4 configuration", id)
 	}
 
 	return nil
@@ -258,7 +318,7 @@ func (d *driver) createNetwork(config *networkConfiguration) *hnsNetwork {
 		endpoints:  make(map[string]*hnsEndpoint),
 		config:     config,
 		driver:     d,
-		portMapper: portmapper.New(""),
+		portMapper: portmapper.New(),
 	}
 
 	d.Lock()
@@ -269,7 +329,7 @@ func (d *driver) createNetwork(config *networkConfiguration) *hnsNetwork {
 }
 
 // Create a new network
-func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
+func (d *driver) CreateNetwork(ctx context.Context, id string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	if _, err := d.getNetwork(id); err == nil {
 		return types.ForbiddenErrorf("network %s exists", id)
 	}
@@ -277,6 +337,12 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 	genData, ok := option[netlabel.GenericData].(map[string]string)
 	if !ok {
 		return fmt.Errorf("Unknown generic data option")
+	}
+
+	if v, ok := option[netlabel.EnableIPv4]; ok {
+		if enable_IPv4, ok := v.(bool); ok && !enable_IPv4 {
+			return types.InvalidParameterErrorf("IPv4 cannot be disabled on Windows")
+		}
 	}
 
 	// Parse and validate the config. It should not conflict with existing networks' config
@@ -326,7 +392,6 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 				Type: "VLAN",
 				VLAN: config.VLAN,
 			})
-
 			if err != nil {
 				return err
 			}
@@ -338,7 +403,6 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 				Type: "VSID",
 				VSID: config.VSID,
 			})
-
 			if err != nil {
 				return err
 			}
@@ -355,9 +419,9 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 		}
 
 		configuration := string(configurationb)
-		logrus.Debugf("HNSNetwork Request =%v Address Space=%v", configuration, subnets)
+		log.G(ctx).Debugf("HNSNetwork Request =%v Address Space=%v", configuration, subnets)
 
-		hnsresponse, err := hcsshim.HNSNetworkRequest("POST", "", configuration)
+		hnsresponse, err := hcsshim.HNSNetworkRequest(http.MethodPost, "", configuration)
 		if err != nil {
 			return err
 		}
@@ -400,15 +464,15 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 		if endpoints, err := hcsshim.HNSListEndpointRequest(); err == nil {
 			for _, ep := range endpoints {
 				if ep.VirtualNetwork == config.HnsID {
-					logrus.Infof("Removing stale HNS endpoint %s", ep.Id)
-					_, err = hcsshim.HNSEndpointRequest("DELETE", ep.Id, "")
+					log.G(ctx).Infof("Removing stale HNS endpoint %s", ep.Id)
+					_, err = hcsshim.HNSEndpointRequest(http.MethodDelete, ep.Id, "")
 					if err != nil {
-						logrus.Warnf("Error removing HNS endpoint %s", ep.Id)
+						log.G(ctx).Warnf("Error removing HNS endpoint %s", ep.Id)
 					}
 				}
 			}
 		} else {
-			logrus.Warnf("Error listing HNS endpoints for network %s", config.HnsID)
+			log.G(ctx).Warnf("Error listing HNS endpoints for network %s", config.HnsID)
 		}
 
 		n.created = true
@@ -420,7 +484,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 func (d *driver) DeleteNetwork(nid string) error {
 	n, err := d.getNetwork(nid)
 	if err != nil {
-		return types.InternalMaskableErrorf("%s", err)
+		return types.InternalMaskableErrorf("%v", err)
 	}
 
 	n.Lock()
@@ -428,9 +492,9 @@ func (d *driver) DeleteNetwork(nid string) error {
 	n.Unlock()
 
 	if n.created {
-		_, err = hcsshim.HNSNetworkRequest("DELETE", config.HnsID, "")
-		if err != nil && err.Error() != errNotFound {
-			return types.ForbiddenErrorf(err.Error())
+		_, err = hcsshim.HNSNetworkRequest(http.MethodDelete, config.HnsID, "")
+		if err != nil && !strings.EqualFold(err.Error(), errNotFound) {
+			return types.ForbiddenErrorf("%v", err)
 		}
 	}
 
@@ -438,10 +502,10 @@ func (d *driver) DeleteNetwork(nid string) error {
 	delete(d.networks, nid)
 	d.Unlock()
 
-	// delele endpoints belong to this network
+	// delete endpoints belong to this network
 	for _, ep := range n.endpoints {
 		if err := d.storeDelete(ep); err != nil {
-			logrus.Warnf("Failed to remove bridge endpoint %.7s from store: %v", ep.id, err)
+			log.G(context.TODO()).Warnf("Failed to remove bridge endpoint %.7s from store: %v", ep.id, err)
 		}
 	}
 
@@ -459,7 +523,6 @@ func convertQosPolicies(qosPolicies []types.QosPolicy) ([]json.RawMessage, error
 			Type:                            "QOS",
 			MaximumOutgoingBandwidthInBytes: elem.MaxEgressBandwidth,
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -496,7 +559,6 @@ func ConvertPortBindings(portBindings []types.PortBinding) ([]json.RawMessage, e
 			Protocol:             elem.Proto.String(),
 			ExternalPortReserved: true,
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -606,7 +668,12 @@ func ParseEndpointConnectivity(epOptions map[string]interface{}) (*EndpointConne
 	return ec, nil
 }
 
-func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
+func (d *driver) CreateEndpoint(ctx context.Context, nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
+	ctx, span := otel.Tracer("").Start(ctx, fmt.Sprintf("libnetwork.drivers.windows_%s.CreateEndpoint", d.name), trace.WithAttributes(
+		attribute.String("nid", nid),
+		attribute.String("eid", eid)))
+	defer span.End()
+
 	n, err := d.getNetwork(nid)
 	if err != nil {
 		return err
@@ -676,13 +743,13 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 
 	// overwrite the ep DisableDNS option if DisableGatewayDNS was set to true during the network creation option
 	if n.config.DisableGatewayDNS {
-		logrus.Debugf("n.config.DisableGatewayDNS[%v] overwrites epOption.DisableDNS[%v]", n.config.DisableGatewayDNS, epOption.DisableDNS)
+		log.G(ctx).Debugf("n.config.DisableGatewayDNS[%v] overwrites epOption.DisableDNS[%v]", n.config.DisableGatewayDNS, epOption.DisableDNS)
 		epOption.DisableDNS = n.config.DisableGatewayDNS
 	}
 
 	if n.driver.name == "nat" && !epOption.DisableDNS {
 		endpointStruct.EnableInternalDNS = true
-		logrus.Debugf("endpointStruct.EnableInternalDNS =[%v]", endpointStruct.EnableInternalDNS)
+		log.G(ctx).Debugf("endpointStruct.EnableInternalDNS =[%v]", endpointStruct.EnableInternalDNS)
 	}
 
 	endpointStruct.DisableICC = epOption.DisableICC
@@ -693,7 +760,6 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 			Policy:     hcsshim.Policy{Type: hcsshim.OutboundNat},
 			Exceptions: n.config.OutboundNatExceptions,
 		})
-
 		if err != nil {
 			return err
 		}
@@ -705,7 +771,7 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 		return err
 	}
 
-	hnsresponse, err := hcsshim.HNSEndpointRequest("POST", "", string(configurationb))
+	hnsresponse, err := hcsshim.HNSEndpointRequest(http.MethodPost, "", string(configurationb))
 	if err != nil {
 		return err
 	}
@@ -732,9 +798,8 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 	endpoint.epConnectivity = epConnectivity
 	endpoint.epOption = epOption
 	endpoint.portMapping, err = ParsePortBindingPolicies(hnsresponse.Policies)
-
 	if err != nil {
-		hcsshim.HNSEndpointRequest("DELETE", hnsresponse.Id, "")
+		hcsshim.HNSEndpointRequest(http.MethodDelete, hnsresponse.Id, "")
 		return err
 	}
 
@@ -751,7 +816,7 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 	}
 
 	if err = d.storeUpdate(endpoint); err != nil {
-		logrus.Errorf("Failed to save endpoint %.7s to store: %v", endpoint.id, err)
+		log.G(ctx).Errorf("Failed to save endpoint %.7s to store: %v", endpoint.id, err)
 	}
 
 	return nil
@@ -760,7 +825,7 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 func (d *driver) DeleteEndpoint(nid, eid string) error {
 	n, err := d.getNetwork(nid)
 	if err != nil {
-		return types.InternalMaskableErrorf("%s", err)
+		return types.InternalMaskableErrorf("%v", err)
 	}
 
 	ep, err := n.getEndpoint(eid)
@@ -776,13 +841,13 @@ func (d *driver) DeleteEndpoint(nid, eid string) error {
 	delete(n.endpoints, eid)
 	n.Unlock()
 
-	_, err = hcsshim.HNSEndpointRequest("DELETE", ep.profileID, "")
-	if err != nil && err.Error() != errNotFound {
+	_, err = hcsshim.HNSEndpointRequest(http.MethodDelete, ep.profileID, "")
+	if err != nil && !strings.EqualFold(err.Error(), errNotFound) {
 		return err
 	}
 
 	if err := d.storeDelete(ep); err != nil {
-		logrus.Warnf("Failed to remove bridge endpoint %.7s from store: %v", ep.id, err)
+		log.G(context.TODO()).Warnf("Failed to remove bridge endpoint %.7s from store: %v", ep.id, err)
 	}
 	return nil
 }
@@ -829,7 +894,13 @@ func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, erro
 }
 
 // Join method is invoked when a Sandbox is attached to an endpoint.
-func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, options map[string]interface{}) error {
+func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, _, options map[string]interface{}) error {
+	ctx, span := otel.Tracer("").Start(ctx, fmt.Sprintf("libnetwork.drivers.windows_%s.Join", d.name), trace.WithAttributes(
+		attribute.String("nid", nid),
+		attribute.String("eid", eid),
+		attribute.String("sboxKey", sboxKey)))
+	defer span.End()
+
 	network, err := d.getNetwork(nid)
 	if err != nil {
 		return err
@@ -864,7 +935,7 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 func (d *driver) Leave(nid, eid string) error {
 	network, err := d.getNetwork(nid)
 	if err != nil {
-		return types.InternalMaskableErrorf("%s", err)
+		return types.InternalMaskableErrorf("%v", err)
 	}
 
 	// Ensure that the endpoint exists
@@ -883,14 +954,6 @@ func (d *driver) Leave(nid, eid string) error {
 	return nil
 }
 
-func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
-	return nil
-}
-
-func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
-	return nil
-}
-
 func (d *driver) NetworkAllocate(id string, option map[string]string, ipV4Data, ipV6Data []driverapi.IPAMData) (map[string]string, error) {
 	return nil, types.NotImplementedErrorf("not implemented")
 }
@@ -905,14 +968,4 @@ func (d *driver) Type() string {
 
 func (d *driver) IsBuiltIn() bool {
 	return true
-}
-
-// DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster
-func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) error {
-	return nil
-}
-
-// DiscoverDelete is a notification for a discovery delete event, such as a node leaving a cluster
-func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
-	return nil
 }

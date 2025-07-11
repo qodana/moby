@@ -1,24 +1,26 @@
-package remotecontext // import "github.com/docker/docker/builder/remotecontext"
+package remotecontext
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/containerd/continuity/driver"
+	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/remotecontext/urlutil"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/patternmatcher"
+	"github.com/moby/patternmatcher/ignorefile"
+	"github.com/moby/sys/symlink"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ClientSessionRemote is identifier for client-session context transport
@@ -26,23 +28,20 @@ const ClientSessionRemote = "client-session"
 
 // Detect returns a context and dockerfile from remote location or local
 // archive.
-func Detect(config backend.BuildConfig) (remote builder.Source, dockerfile *parser.Result, err error) {
+func Detect(config backend.BuildConfig) (remote builder.Source, dockerfile *parser.Result, _ error) {
 	remoteURL := config.Options.RemoteContext
-	dockerfilePath := config.Options.Dockerfile
-
 	switch {
 	case remoteURL == "":
-		remote, dockerfile, err = newArchiveRemote(config.Source, dockerfilePath)
+		return newArchiveRemote(config.Source, config.Options.Dockerfile)
 	case remoteURL == ClientSessionRemote:
 		return nil, nil, errdefs.InvalidParameter(errors.New("experimental session with v1 builder is no longer supported, use builder version v2 (BuildKit) instead"))
 	case urlutil.IsGitURL(remoteURL):
-		remote, dockerfile, err = newGitRemote(remoteURL, dockerfilePath)
+		return newGitRemote(remoteURL, config.Options.Dockerfile)
 	case urlutil.IsURL(remoteURL):
-		remote, dockerfile, err = newURLRemote(remoteURL, dockerfilePath, config.ProgressWriter.ProgressReaderFunc)
+		return newURLRemote(remoteURL, config.Options.Dockerfile, config.ProgressWriter.ProgressReaderFunc)
 	default:
-		err = fmt.Errorf("remoteURL (%s) could not be recognized as URL", remoteURL)
+		return nil, nil, fmt.Errorf("remoteURL (%s) could not be recognized as URL", remoteURL)
 	}
-	return
 }
 
 func newArchiveRemote(rc io.ReadCloser, dockerfilePath string) (builder.Source, *parser.Result, error) {
@@ -102,7 +101,7 @@ func newURLRemote(url string, dockerfilePath string, progressReader func(in io.R
 	defer content.Close()
 
 	switch contentType {
-	case mimeTypes.TextPlain:
+	case mimeTypeTextPlain:
 		res, err := parser.Parse(progressReader(content))
 		return nil, res, errdefs.InvalidParameter(err)
 	default:
@@ -123,17 +122,17 @@ func removeDockerfile(c modifiableContext, filesToRemove ...string) error {
 	case err != nil:
 		return err
 	}
-	excludes, err := dockerignore.ReadAll(f)
+	excludes, err := ignorefile.ReadAll(f)
 	if err != nil {
 		f.Close()
-		return err
+		return errors.Wrap(err, "error reading .dockerignore")
 	}
 	f.Close()
 	filesToRemove = append([]string{".dockerignore"}, filesToRemove...)
 	for _, fileToRemove := range filesToRemove {
 		if rm, _ := patternmatcher.MatchesOrParentMatches(fileToRemove, excludes); rm {
 			if err := c.Remove(fileToRemove); err != nil {
-				logrus.Errorf("failed to remove %s: %v", fileToRemove, err)
+				log.G(context.TODO()).Errorf("failed to remove %s: %v", fileToRemove, err)
 			}
 		}
 	}
@@ -176,7 +175,8 @@ func StatAt(remote builder.Source, path string) (os.FileInfo, error) {
 
 // FullPath is a helper for getting a full path for a path from a source
 func FullPath(remote builder.Source, path string) (string, error) {
-	fullPath, err := containerfs.ResolveScopedPath(remote.Root(), path)
+	remoteRoot := remote.Root()
+	fullPath, err := symlink.FollowSymlinkInScope(filepath.Join(remoteRoot, path), remoteRoot)
 	if err != nil {
 		if runtime.GOOS == "windows" {
 			return "", fmt.Errorf("failed to resolve scoped path %s (%s): %s. Possible cause is a forbidden path outside the build context", path, fullPath, err)

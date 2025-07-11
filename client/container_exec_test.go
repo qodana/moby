@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,18 +10,39 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerExecCreateError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	_, err := client.ContainerExecCreate(context.Background(), "container_id", types.ExecConfig{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+
+	_, err := client.ContainerExecCreate(context.Background(), "container_id", container.ExecOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerExecCreate(context.Background(), "", container.ExecOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerExecCreate(context.Background(), "    ", container.ExecOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+}
+
+// TestContainerExecCreateConnectionError verifies that connection errors occurring
+// during API-version negotiation are not shadowed by API-version errors.
+//
+// Regression test for https://github.com/docker/cli/issues/4890
+func TestContainerExecCreateConnectionError(t *testing.T) {
+	client, err := NewClientWithOpts(WithAPIVersionNegotiation(), WithHost("tcp://no-such-host.invalid"))
+	assert.NilError(t, err)
+
+	_, err = client.ContainerExecCreate(context.Background(), "container_id", container.ExecOptions{})
+	assert.Check(t, is.ErrorType(err, IsErrConnectionFailed))
 }
 
 func TestContainerExecCreate(t *testing.T) {
@@ -38,14 +59,14 @@ func TestContainerExecCreate(t *testing.T) {
 			if err := req.ParseForm(); err != nil {
 				return nil, err
 			}
-			execConfig := &types.ExecConfig{}
+			execConfig := &container.ExecOptions{}
 			if err := json.NewDecoder(req.Body).Decode(execConfig); err != nil {
 				return nil, err
 			}
 			if execConfig.User != "user" {
 				return nil, fmt.Errorf("expected an execConfig with User == 'user', got %v", execConfig)
 			}
-			b, err := json.Marshal(types.IDResponse{
+			b, err := json.Marshal(container.ExecCreateResponse{
 				ID: "exec_id",
 			})
 			if err != nil {
@@ -58,25 +79,19 @@ func TestContainerExecCreate(t *testing.T) {
 		}),
 	}
 
-	r, err := client.ContainerExecCreate(context.Background(), "container_id", types.ExecConfig{
+	r, err := client.ContainerExecCreate(context.Background(), "container_id", container.ExecOptions{
 		User: "user",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.ID != "exec_id" {
-		t.Fatalf("expected `exec_id`, got %s", r.ID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(r.ID, "exec_id"))
 }
 
 func TestContainerExecStartError(t *testing.T) {
 	client := &Client{
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
-	err := client.ContainerExecStart(context.Background(), "nothing", types.ExecStartCheck{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	err := client.ContainerExecStart(context.Background(), "nothing", container.ExecStartOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestContainerExecStart(t *testing.T) {
@@ -89,12 +104,12 @@ func TestContainerExecStart(t *testing.T) {
 			if err := req.ParseForm(); err != nil {
 				return nil, err
 			}
-			execStartCheck := &types.ExecStartCheck{}
-			if err := json.NewDecoder(req.Body).Decode(execStartCheck); err != nil {
+			options := &container.ExecStartOptions{}
+			if err := json.NewDecoder(req.Body).Decode(options); err != nil {
 				return nil, err
 			}
-			if execStartCheck.Tty || !execStartCheck.Detach {
-				return nil, fmt.Errorf("expected execStartCheck{Detach:true,Tty:false}, got %v", execStartCheck)
+			if options.Tty || !options.Detach {
+				return nil, fmt.Errorf("expected ExecStartOptions{Detach:true,Tty:false}, got %v", options)
 			}
 
 			return &http.Response{
@@ -104,13 +119,11 @@ func TestContainerExecStart(t *testing.T) {
 		}),
 	}
 
-	err := client.ContainerExecStart(context.Background(), "exec_id", types.ExecStartCheck{
+	err := client.ContainerExecStart(context.Background(), "exec_id", container.ExecStartOptions{
 		Detach: true,
 		Tty:    false,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 }
 
 func TestContainerExecInspectError(t *testing.T) {
@@ -118,9 +131,7 @@ func TestContainerExecInspectError(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 	_, err := client.ContainerExecInspect(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestContainerExecInspect(t *testing.T) {
@@ -130,7 +141,7 @@ func TestContainerExecInspect(t *testing.T) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
-			b, err := json.Marshal(types.ContainerExecInspect{
+			b, err := json.Marshal(container.ExecInspect{
 				ExecID:      "exec_id",
 				ContainerID: "container_id",
 			})
@@ -145,13 +156,7 @@ func TestContainerExecInspect(t *testing.T) {
 	}
 
 	inspect, err := client.ContainerExecInspect(context.Background(), "exec_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if inspect.ExecID != "exec_id" {
-		t.Fatalf("expected ExecID to be `exec_id`, got %s", inspect.ExecID)
-	}
-	if inspect.ContainerID != "container_id" {
-		t.Fatalf("expected ContainerID `container_id`, got %s", inspect.ContainerID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(inspect.ExecID, "exec_id"))
+	assert.Check(t, is.Equal(inspect.ContainerID, "container_id"))
 }

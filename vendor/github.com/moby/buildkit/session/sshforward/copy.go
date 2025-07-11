@@ -9,8 +9,8 @@ import (
 )
 
 type Stream interface {
-	SendMsg(m interface{}) error
-	RecvMsg(m interface{}) error
+	SendMsg(m any) error
+	RecvMsg(m any) error
 }
 
 func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStream func() error) error {
@@ -21,13 +21,15 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStre
 		p := &BytesMessage{}
 		for {
 			if err := stream.RecvMsg(p); err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					// indicates client performed CloseSend, but they may still be
 					// reading data
-					if conn, ok := conn.(interface {
+					if closeWriter, ok := conn.(interface {
 						CloseWrite() error
 					}); ok {
-						conn.CloseWrite()
+						closeWriter.CloseWrite()
+					} else {
+						conn.Close()
 					}
 					return nil
 				}
@@ -37,7 +39,7 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStre
 			select {
 			case <-ctx.Done():
 				conn.Close()
-				return ctx.Err()
+				return context.Cause(ctx)
 			default:
 			}
 			if _, err := conn.Write(p.Data); err != nil {
@@ -53,7 +55,7 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStre
 			buf := make([]byte, 32*1024)
 			n, err := conn.Read(buf)
 			switch {
-			case err == io.EOF:
+			case errors.Is(err, io.EOF):
 				if closeStream != nil {
 					closeStream()
 				}
@@ -63,7 +65,7 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStre
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			default:
 			}
 			p := &BytesMessage{Data: buf[:n]}

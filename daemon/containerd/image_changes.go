@@ -2,73 +2,49 @@ package containerd
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/mount"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/google/uuid"
-	"github.com/opencontainers/image-spec/identity"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/log"
+	"github.com/docker/docker/daemon/container"
+	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/go-archive"
 )
 
-func (i *ImageService) Changes(ctx context.Context, container *container.Container) ([]archive.Change, error) {
-	cs := i.client.ContentStore()
-
-	imageManifest, err := getContainerImageManifest(container)
+func (i *ImageService) Changes(ctx context.Context, ctr *container.Container) ([]archive.Change, error) {
+	rwl := ctr.RWLayer
+	if rwl == nil {
+		return nil, fmt.Errorf("RWLayer is unexpectedly nil for container %s", ctr.ID)
+	}
+	snapshotter := i.client.SnapshotService(ctr.Driver)
+	info, err := snapshotter.Stat(ctx, ctr.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	imageManifestBytes, err := content.ReadBlob(ctx, cs, imageManifest)
-	if err != nil {
-		return nil, err
-	}
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(imageManifestBytes, &manifest); err != nil {
-		return nil, err
-	}
+	id := stringid.GenerateRandomID()
+	parentViewKey := ctr.ID + "-parent-view-" + id
+	imageMounts, _ := snapshotter.View(ctx, parentViewKey, info.Parent)
 
-	imageConfigBytes, err := content.ReadBlob(ctx, cs, manifest.Config)
-	if err != nil {
-		return nil, err
-	}
-	var image ocispec.Image
-	if err := json.Unmarshal(imageConfigBytes, &image); err != nil {
-		return nil, err
-	}
+	defer func() {
+		if err := snapshotter.Remove(ctx, parentViewKey); err != nil {
+			log.G(ctx).WithError(err).Warn("error removing the parent view snapshot")
+		}
+	}()
 
-	rnd, err := uuid.NewRandom()
-	if err != nil {
-		return nil, err
-	}
-
-	snapshotter := i.client.SnapshotService(container.Driver)
-
-	diffIDs := image.RootFS.DiffIDs
-	parent, err := snapshotter.View(ctx, rnd.String(), identity.ChainID(diffIDs).String())
+	containerRoot, err := rwl.Mount(ctr.GetMountLabel())
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err := snapshotter.Remove(ctx, rnd.String()); err != nil {
-			logrus.WithError(err).WithField("key", rnd.String()).Warn("remove temporary snapshot")
+		if err := rwl.Unmount(); err != nil {
+			log.G(ctx).WithFields(log.Fields{"error": err, "container": ctr.ID}).Warn("Failed to unmount container RWLayer after export")
 		}
 	}()
-
-	mounts, err := snapshotter.Mounts(ctx, container.ID)
-	if err != nil {
-		return nil, err
-	}
-
 	var changes []archive.Change
-	err = mount.WithReadonlyTempMount(ctx, mounts, func(fs string) error {
-		return mount.WithTempMount(ctx, parent, func(root string) error {
-			changes, err = archive.ChangesDirs(fs, root)
-			return err
-		})
+	err = mount.WithReadonlyTempMount(ctx, imageMounts, func(imageRoot string) error {
+		changes, err = archive.ChangesDirs(containerRoot, imageRoot)
+		return err
 	})
 	return changes, err
 }

@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/checkpoint"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestCheckpointDeleteError(t *testing.T) {
@@ -18,13 +20,19 @@ func TestCheckpointDeleteError(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
-	err := client.CheckpointDelete(context.Background(), "container_id", types.CheckpointDeleteOptions{
+	err := client.CheckpointDelete(context.Background(), "container_id", checkpoint.DeleteOptions{
 		CheckpointID: "checkpoint_id",
 	})
 
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	err = client.CheckpointDelete(context.Background(), "", checkpoint.DeleteOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	err = client.CheckpointDelete(context.Background(), "    ", checkpoint.DeleteOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestCheckpointDelete(t *testing.T) {
@@ -45,11 +53,8 @@ func TestCheckpointDelete(t *testing.T) {
 		}),
 	}
 
-	err := client.CheckpointDelete(context.Background(), "container_id", types.CheckpointDeleteOptions{
+	err := client.CheckpointDelete(context.Background(), "container_id", checkpoint.DeleteOptions{
 		CheckpointID: "checkpoint_id",
 	})
-
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 }

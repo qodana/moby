@@ -1,60 +1,67 @@
 package libnetwork
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/containerd/log"
+	"github.com/docker/docker/libnetwork/internal/nftables"
 	"github.com/docker/docker/libnetwork/iptables"
-	"github.com/sirupsen/logrus"
 )
 
 const userChain = "DOCKER-USER"
 
-var ctrl *Controller
-
-func setupArrangeUserFilterRule(c *Controller) {
-	ctrl = c
-	iptables.OnReloaded(arrangeUserFilterRule)
+func (c *Controller) selectFirewallBackend() {
+	// Only try to use nftables if explicitly enabled by env-var.
+	// TODO(robmry) - command line options?
+	if os.Getenv("DOCKER_FIREWALL_BACKEND") == "nftables" {
+		_ = nftables.Enable()
+	}
 }
 
-// This chain allow users to configure firewall policies in a way that persists
-// docker operations/restarts. Docker will not delete or modify any pre-existing
-// rules from the DOCKER-USER filter chain.
-// Note once DOCKER-USER chain is created, docker engine does not remove it when
-// IPTableForwarding is disabled, because it contains rules configured by user that
-// are beyond docker engine's control.
-func arrangeUserFilterRule() {
-	if ctrl == nil {
+// Sets up the DOCKER-USER chain for each iptables version (IPv4, IPv6) that's
+// enabled in the controller's configuration.
+func (c *Controller) setupUserChains() {
+	// There's no equivalent to DOCKER-USER in the nftables implementation.
+	if nftables.Enabled() {
 		return
 	}
 
-	conds := []struct {
-		ipVer iptables.IPVersion
-		cond  bool
-	}{
-		{ipVer: iptables.IPv4, cond: ctrl.iptablesEnabled()},
-		{ipVer: iptables.IPv6, cond: ctrl.ip6tablesEnabled()},
+	setup := func() error {
+		var errs []error
+		for _, ipVersion := range c.enabledIptablesVersions() {
+			errs = append(errs, setupUserChain(ipVersion))
+		}
+		return errors.Join(errs...)
 	}
-
-	for _, ipVerCond := range conds {
-		cond := ipVerCond.cond
-		if !cond {
-			continue
-		}
-
-		ipVer := ipVerCond.ipVer
-		iptable := iptables.GetIptable(ipVer)
-		_, err := iptable.NewChain(userChain, iptables.Filter, false)
-		if err != nil {
-			logrus.WithError(err).Warnf("Failed to create %s %v chain", userChain, ipVer)
-			return
-		}
-
-		if err = iptable.AddReturnRule(userChain); err != nil {
-			logrus.WithError(err).Warnf("Failed to add the RETURN rule for %s %v", userChain, ipVer)
-			return
-		}
-
-		err = iptable.EnsureJumpRule("FORWARD", userChain)
-		if err != nil {
-			logrus.WithError(err).Warnf("Failed to ensure the jump rule for %s %v", userChain, ipVer)
-		}
+	if err := setup(); err != nil {
+		log.G(context.Background()).WithError(err).Warn("configuring " + userChain)
 	}
+	iptables.OnReloaded(func() {
+		if err := setup(); err != nil {
+			log.G(context.Background()).WithError(err).Warn("configuring " + userChain + " on firewall reload")
+		}
+	})
+}
+
+// setupUserChain sets up the DOCKER-USER chain for the given [iptables.IPVersion].
+//
+// This chain allows users to configure firewall policies in a way that
+// persist daemon operations/restarts. The daemon does not delete or modify
+// any pre-existing rules from the DOCKER-USER filter chain.
+//
+// Once the DOCKER-USER chain is created, the daemon does not remove it when
+// IPTableForwarding is disabled, because it contains rules configured by user
+// that are beyond the daemon's control.
+func setupUserChain(ipVersion iptables.IPVersion) error {
+	ipt := iptables.GetIptable(ipVersion)
+	if _, err := ipt.NewChain(userChain, iptables.Filter); err != nil {
+		return fmt.Errorf("failed to create %s %v chain: %v", userChain, ipVersion, err)
+	}
+	if err := ipt.EnsureJumpRule("FORWARD", userChain); err != nil {
+		return fmt.Errorf("failed to ensure the jump rule for %s %v: %w", userChain, ipVersion, err)
+	}
+	return nil
 }

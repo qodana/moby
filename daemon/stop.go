@@ -1,15 +1,16 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"time"
 
+	"github.com/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/daemon/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/moby/sys/signal"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ContainerStop looks for the given container and stops it.
@@ -26,7 +27,12 @@ func (daemon *Daemon) ContainerStop(ctx context.Context, name string, options co
 		return err
 	}
 	if !ctr.IsRunning() {
-		return containerNotModifiedError{}
+		// This is not an actual error, but produces a 304 "not modified"
+		// when returned through the API to indicates the container is
+		// already in the desired state. It's implemented as an error
+		// to make the code calling this function terminate early (as
+		// no further processing is needed).
+		return errdefs.NotModified(errors.New("container is already stopped"))
 	}
 	err = daemon.containerStop(ctx, ctr, options)
 	if err != nil {
@@ -35,8 +41,13 @@ func (daemon *Daemon) ContainerStop(ctx context.Context, name string, options co
 	return nil
 }
 
-// containerStop sends a stop signal, waits, sends a kill signal.
+// containerStop sends a stop signal, waits, sends a kill signal. It uses
+// a [context.WithoutCancel], so cancelling the context does not cancel
+// the request to stop the container.
 func (daemon *Daemon) containerStop(ctx context.Context, ctr *container.Container, options containertypes.StopOptions) (retErr error) {
+	// Cancelling the request should not cancel the stop.
+	ctx = context.WithoutCancel(ctx)
+
 	if !ctr.IsRunning() {
 		return nil
 	}
@@ -62,7 +73,10 @@ func (daemon *Daemon) containerStop(ctx context.Context, ctr *container.Containe
 	}
 	defer func() {
 		if retErr == nil {
-			daemon.LogContainerEvent(ctr, "stop")
+			daemon.LogContainerEvent(ctr, events.ActionStop)
+			// Ensure container status changes are committed by handler of container exit before returning control to the caller
+			ctr.Lock()
+			defer ctr.Unlock()
 		}
 	}()
 
@@ -81,14 +95,14 @@ func (daemon *Daemon) containerStop(ctx context.Context, ctr *container.Containe
 	}
 	defer cancel()
 
-	if status := <-ctr.Wait(subCtx, container.WaitConditionNotRunning); status.Err() == nil {
+	if status := <-ctr.Wait(subCtx, containertypes.WaitConditionNotRunning); status.Err() == nil {
 		// container did exit, so ignore any previous errors and return
 		return nil
 	}
 
 	if err != nil {
 		// the container has still not exited, and the kill function errored, so log the error here:
-		logrus.WithError(err).WithField("container", ctr.ID).Errorf("Error sending stop (signal %d) to container", stopSignal)
+		log.G(ctx).WithError(err).WithField("container", ctr.ID).Errorf("Error sending stop (signal %d) to container", stopSignal)
 	}
 	if stopTimeout < 0 {
 		// if the client requested that we never kill / wait forever, but container.Wait was still
@@ -96,16 +110,16 @@ func (daemon *Daemon) containerStop(ctx context.Context, ctr *container.Containe
 		return err
 	}
 
-	logrus.WithField("container", ctr.ID).Infof("Container failed to exit within %s of signal %d - using the force", wait, stopSignal)
+	log.G(ctx).WithField("container", ctr.ID).Infof("Container failed to exit within %s of signal %d - using the force", wait, stopSignal)
 
 	// Stop either failed or container didn't exit, so fallback to kill.
 	if err := daemon.Kill(ctr); err != nil {
 		// got a kill error, but give container 2 more seconds to exit just in case
 		subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		status := <-ctr.Wait(subCtx, container.WaitConditionNotRunning)
+		status := <-ctr.Wait(subCtx, containertypes.WaitConditionNotRunning)
 		if status.Err() != nil {
-			logrus.WithError(err).WithField("container", ctr.ID).Errorf("error killing container: %v", status.Err())
+			log.G(ctx).WithError(err).WithField("container", ctr.ID).Errorf("error killing container: %v", status.Err())
 			return err
 		}
 		// container did exit, so ignore previous errors and continue

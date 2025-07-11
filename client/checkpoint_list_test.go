@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/checkpoint"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestCheckpointListError(t *testing.T) {
@@ -19,10 +21,8 @@ func TestCheckpointListError(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 
-	_, err := client.CheckpointList(context.Background(), "container_id", types.CheckpointListOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err := client.CheckpointList(context.Background(), "container_id", checkpoint.ListOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestCheckpointList(t *testing.T) {
@@ -33,7 +33,7 @@ func TestCheckpointList(t *testing.T) {
 			if !strings.HasPrefix(req.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
 			}
-			content, err := json.Marshal([]types.Checkpoint{
+			content, err := json.Marshal([]checkpoint.Summary{
 				{
 					Name: "checkpoint",
 				},
@@ -48,13 +48,9 @@ func TestCheckpointList(t *testing.T) {
 		}),
 	}
 
-	checkpoints, err := client.CheckpointList(context.Background(), "container_id", types.CheckpointListOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(checkpoints) != 1 {
-		t.Fatalf("expected 1 checkpoint, got %v", checkpoints)
-	}
+	checkpoints, err := client.CheckpointList(context.Background(), "container_id", checkpoint.ListOptions{})
+	assert.NilError(t, err)
+	assert.Check(t, is.Len(checkpoints, 1))
 }
 
 func TestCheckpointListContainerNotFound(t *testing.T) {
@@ -62,8 +58,6 @@ func TestCheckpointListContainerNotFound(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
 	}
 
-	_, err := client.CheckpointList(context.Background(), "unknown", types.CheckpointListOptions{})
-	if err == nil || !IsErrNotFound(err) {
-		t.Fatalf("expected a containerNotFound error, got %v", err)
-	}
+	_, err := client.CheckpointList(context.Background(), "unknown", checkpoint.ListOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }

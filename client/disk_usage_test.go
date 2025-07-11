@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestDiskUsageError(t *testing.T) {
@@ -19,9 +21,7 @@ func TestDiskUsageError(t *testing.T) {
 		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
 	}
 	_, err := client.DiskUsage(context.Background(), types.DiskUsageOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestDiskUsage(t *testing.T) {
@@ -50,7 +50,6 @@ func TestDiskUsage(t *testing.T) {
 			}, nil
 		}),
 	}
-	if _, err := client.DiskUsage(context.Background(), types.DiskUsageOptions{}); err != nil {
-		t.Fatal(err)
-	}
+	_, err := client.DiskUsage(context.Background(), types.DiskUsageOptions{})
+	assert.NilError(t, err)
 }

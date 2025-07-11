@@ -1,7 +1,7 @@
 // Package jsonfilelog provides the default Logger implementation for
 // Docker logging. This logger logs to files on the host server in the
 // JSON format.
-package jsonfilelog // import "github.com/docker/docker/daemon/logger/jsonfilelog"
+package jsonfilelog
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
 	"github.com/docker/docker/daemon/logger/loggerutils"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
 	"github.com/pkg/errors"
 )
 
@@ -54,10 +54,10 @@ func New(info logger.Info) (logger.Logger, error) {
 			return nil, err
 		}
 		if capval <= 0 {
-			return nil, fmt.Errorf("max-size must be a positive number")
+			return nil, errors.New("max-size must be a positive number")
 		}
 	}
-	var maxFiles = 1
+	maxFiles := 1
 	if maxFileString, ok := info.Config["max-file"]; ok {
 		var err error
 		maxFiles, err = strconv.Atoi(maxFileString)
@@ -65,7 +65,7 @@ func New(info logger.Info) (logger.Logger, error) {
 			return nil, err
 		}
 		if maxFiles < 1 {
-			return nil, fmt.Errorf("max-file cannot be less than 1")
+			return nil, errors.New("max-file cannot be less than 1")
 		}
 	}
 
@@ -77,11 +77,11 @@ func New(info logger.Info) (logger.Logger, error) {
 			return nil, err
 		}
 		if compress && (maxFiles == 1 || capval == -1) {
-			return nil, fmt.Errorf("compress cannot be true when max-file is less than 2 or max-size is not set")
+			return nil, errors.New("compress cannot be true when max-file is less than 2 or max-size is not set")
 		}
 	}
 
-	attrs, err := info.ExtraAttributes(nil)
+	extraAttrs, err := info.ExtraAttributes(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -92,19 +92,19 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, err
 	}
 	if tag != "" {
-		attrs["tag"] = tag
+		extraAttrs["tag"] = tag
 	}
 
 	var extra json.RawMessage
-	if len(attrs) > 0 {
+	if len(extraAttrs) > 0 {
 		var err error
-		extra, err = json.Marshal(attrs)
+		extra, err = json.Marshal(extraAttrs)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	writer, err := loggerutils.NewLogFile(info.LogPath, capval, maxFiles, compress, decodeFunc, 0640, getTailReader)
+	writer, err := loggerutils.NewLogFile(info.LogPath, capval, maxFiles, compress, decodeFunc, 0o640, getTailReader)
 	if err != nil {
 		return nil, err
 	}
